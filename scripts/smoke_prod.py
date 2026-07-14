@@ -79,7 +79,12 @@ except Exception as e:
 try:
     r = rpc("tools/list")
     tools = [t["name"] for t in r["result"]["tools"]]
-    check("tools/list", len(tools) == 14, f"{len(tools)} tools")
+    check(
+        "tools/list",
+        len(tools) == 16
+        and "anchorage_gis__footprint_for_parcel" in tools,
+        f"{len(tools)} tools",
+    )
 except Exception as e:
     check("tools/list", False, repr(e))
 
