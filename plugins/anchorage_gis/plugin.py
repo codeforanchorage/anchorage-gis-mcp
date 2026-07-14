@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
+import pyclipper
 
 from core.interfaces import DataPlugin, PluginType, ToolDefinition, ToolResult
 from plugins.anchorage_gis.config_schema import AnchorageGISPluginConfig
@@ -4071,6 +4072,534 @@ class AnchorageGISPlugin(DataPlugin):
             ]
         return "\n".join(lines)
 
+    # ── footprint_for_parcel: lot coverage / ADU headroom ────────────────
+    #
+    # TODO follow-ups (deliberately not built yet):
+    # - coverage_for_area(grid_map | community_council): batch rollup that
+    #   pages parcels and reuses this per-parcel clip. aggregate_by_polygon
+    #   is NOT a substitute -- it pulls source features to a 5,000 cap with
+    #   no geographic prefilter and assigns whole buildings by centroid,
+    #   double-dumping shared footprints.
+    # - Detached-only fast path: server-side outStatistics
+    #   SUM(Shape__Area) / 4.26 where Total_Living_Units = 1 and a single
+    #   building intersects -- faster for bulk screening.
+    # - Pluggable footprint source (FEMA USA Structures / Overture) behind
+    #   the same tool signature, for QA / gap-fill.
+
+    # Residential base maximum lot coverage by zoning district, from AMC
+    # 21.06.020 Table 21.06-1 (https://ecode360.com/49423901). Hardcoded
+    # snapshot of the published table -- TODO: re-sync if Title 21 amends
+    # it (the eCode MCP serves the live text but is a separate connector
+    # this server cannot call). R4A is intentionally absent: the table
+    # sets no maximum lot coverage for it.
+    LOT_COVERAGE_CAPS = {
+        "R1": 0.40,
+        "R1A": 0.40,
+        "R2A": 0.40,
+        "R2D": 0.40,
+        "R2M": 0.40,
+        "R3A": 0.50,
+        "R3": 0.60,  # townhouse / multifamily districts
+        "R4": 0.60,
+        "R5": 0.30,
+        "R6": 0.30,
+        "R7": 0.30,
+        "R8": 0.05,
+        "R9": 0.10,
+    }
+    # Table 21.06-1 note 3: in these districts the cap rises to 50% on
+    # lots under 10,000 sqft IF the principal structure is < 16 ft tall.
+    LOT_COVERAGE_NOTE3_DISTRICTS = frozenset(
+        {"R1", "R1A", "R2A", "R2D", "R2M"}
+    )
+    LOT_COVERAGE_UNRESTRICTED = frozenset({"R4A"})
+    NOTE3_LOT_SQFT = 10000.0
+    NOTE3_CAP = 0.50
+
+    M2_TO_SQFT = 10.7639
+    # Integer scaling for pyclipper: 1 clipper unit = 1 mm in EPSG:3338
+    # meters, so area comes back in mm^2 / CLIP_SCALE^2.
+    CLIP_SCALE = 1000.0
+    # A building that merely grazes a shared lot line clips to a sliver;
+    # anything under this area (m^2) still counts toward footprint area
+    # but not toward building_count.
+    FOOTPRINT_COUNT_MIN_M2 = 1.0
+    FOOTPRINT_BUILDING_LIMIT = 500
+    # Fields fetched from the assessor parcel layer for the report.
+    FOOTPRINT_PARCEL_FIELDS = (
+        "Parcel_ID",
+        "GIS_ParcelNum11",
+        "Parcel_Address",
+        "Property_Type",
+        "Land_Use",
+        "Total_Living_Units",
+        "Lot_Size",
+        "Zoning_District",
+        "Grid_Map",
+        "Condo_Unit_Number",
+        "Parcel_ID_URL",
+    )
+
+    @classmethod
+    def _normalize_zoning_district(cls, raw: Any) -> Tuple[str, str]:
+        """Normalize a stored ``Zoning_District`` value for cap lookup.
+
+        Returns ``(base_zone, code_area)`` where ``code_area`` is
+        ``'bowl'``, ``'chugiak-eagle river'`` (``CE...`` districts,
+        AMC ch. 21.10) or ``'girdwood'`` (``G...`` districts, ch.
+        21.09). Strips hyphens/spaces and one trailing ``SL``
+        (special limitations) suffix. Stored examples: ``R2D``,
+        ``R6SL``, ``CER1``, ``CE-R1A``, ``CE RO``, ``GR1``.
+        """
+        z = re.sub(r"[\s\-]+", "", str(raw or "").upper())
+        code_area = "bowl"
+        if z.startswith("CE"):
+            code_area = "chugiak-eagle river"
+            z = z[2:]
+        elif z.startswith("G"):
+            # No Anchorage Bowl district code starts with G (verified
+            # against the live distinct Zoning_District values).
+            code_area = "girdwood"
+            z = z[1:]
+        if z.endswith("SL") and len(z) > 2:
+            z = z[:-2]
+        return z, code_area
+
+    @classmethod
+    def _ring_to_clipper_path(
+        cls, ring: List[List[float]]
+    ) -> Optional[List[Tuple[int, int]]]:
+        """One coordinate ring -> integer pyclipper path (or None)."""
+        path = [
+            (
+                int(round(pt[0] * cls.CLIP_SCALE)),
+                int(round(pt[1] * cls.CLIP_SCALE)),
+            )
+            for pt in ring
+        ]
+        # Drop the duplicated closing vertex if present.
+        if len(path) > 1 and path[0] == path[-1]:
+            path.pop()
+        return path if len(path) >= 3 else None
+
+    @classmethod
+    def _esri_rings_to_clipper_paths(
+        cls, rings: List[List[List[float]]]
+    ) -> List[List[Tuple[int, int]]]:
+        """Esri ``rings`` -> pyclipper paths, orientation preserved.
+
+        Intended for the CLIP side of an intersection with
+        PFT_EVENODD, which is orientation-agnostic, so outer rings
+        and holes need no normalization.
+        """
+        paths = []
+        for ring in rings or []:
+            p = cls._ring_to_clipper_path(ring)
+            if p is not None:
+                paths.append(p)
+        return paths
+
+    @classmethod
+    def _geojson_to_clipper_paths(
+        cls, geometry: Dict[str, Any]
+    ) -> List[List[Tuple[int, int]]]:
+        """GeoJSON Polygon/MultiPolygon -> oriented pyclipper paths.
+
+        Each polygon's exterior ring is forced CCW and its holes CW,
+        so a PFT_NONZERO fill unions overlapping polygons instead of
+        cancelling them (source data orientation is not trusted).
+        """
+        gtype = (geometry or {}).get("type", "")
+        coords = (geometry or {}).get("coordinates") or []
+        if gtype == "Polygon":
+            polys = [coords]
+        elif gtype == "MultiPolygon":
+            polys = list(coords)
+        else:
+            return []
+        paths = []
+        for poly in polys:
+            for i, ring in enumerate(poly):
+                p = cls._ring_to_clipper_path(ring)
+                if p is None:
+                    continue
+                want_ccw = i == 0  # exterior first, then holes
+                if pyclipper.Orientation(p) != want_ccw:
+                    p.reverse()
+                paths.append(p)
+        return paths
+
+    @classmethod
+    def _clip_intersection_area_m2(
+        cls,
+        subject_paths: List[List[Tuple[int, int]]],
+        clip_paths: List[List[Tuple[int, int]]],
+    ) -> float:
+        """Area of (subject ∩ clip) in m^2 via robust integer clipping.
+
+        Subject paths must be oriented (``_geojson_to_clipper_paths``)
+        so PFT_NONZERO unions overlapping subject polygons -- summing
+        per-polygon clips would double-count overlaps. Holes in the
+        solution come back oppositely oriented, so the signed ring
+        areas net out correctly.
+        """
+        if not subject_paths or not clip_paths:
+            return 0.0
+        pc = pyclipper.Pyclipper()
+        pc.AddPaths(subject_paths, pyclipper.PT_SUBJECT, True)
+        pc.AddPaths(clip_paths, pyclipper.PT_CLIP, True)
+        solution = pc.Execute(
+            pyclipper.CT_INTERSECTION,
+            pyclipper.PFT_NONZERO,
+            pyclipper.PFT_EVENODD,
+        )
+        area = sum(pyclipper.Area(p) for p in solution)
+        return abs(area) / (cls.CLIP_SCALE**2)
+
+    async def _footprint_for_parcel(self, args: Dict[str, Any]) -> str:
+        """Real lot coverage + ADU footprint headroom for one parcel.
+
+        Spatially joins MOA building footprints to the parcel polygon
+        (the buildings layer has no parcel key), CLIPS each building
+        to the lot (attached / zero-lot-line rows share one polygon
+        across several platted lots), sums the clipped area in
+        EPSG:3338 (Alaska Albers, equal-area), and compares against
+        the zoning district's maximum-lot-coverage cap.
+
+        Never trusts ``Shape__Area``: both layers are published in
+        Web Mercator (3857), where stored areas run ~4.26x true
+        ground area at Anchorage's latitude.
+        """
+        parcel_id = (args.get("parcel_id") or "").strip()
+        if not parcel_id:
+            raise ValueError("parcel_id is required")
+        variants = self._normalize_parcel_variants(parcel_id)
+        if not variants:
+            raise ValueError(
+                f"Could not extract any digits from parcel_id "
+                f"{parcel_id!r}. Provide a parcel ID like "
+                f"'001-213-29', '00121329', or '00121329000'."
+            )
+
+        parcel_item_id = self.plugin_config.property_item_id
+        parcel_url = await self._resolve_layer_url(parcel_item_id)
+        quoted = ",".join(
+            "'" + v.replace("'", "''") + "'" for v in variants
+        )
+        where = WhereValidator.validate(
+            f"(GIS_ParcelNum11 IN ({quoted}) OR Parcel_ID IN ({quoted})) "
+            f"AND GIS_Category = 'Parcel'"
+        )
+        data = await self._request_json_with_retry(
+            f"{parcel_url}/query",
+            method="post",
+            data={
+                "f": "json",
+                "where": where,
+                "outFields": ",".join(self.FOOTPRINT_PARCEL_FIELDS),
+                "returnGeometry": "true",
+                "outSR": "3338",
+                "resultRecordCount": "11",
+            },
+        )
+        features = data.get("features") or []
+
+        if not features:
+            return "\n".join([
+                f"## Lot coverage: no parcel found for `{parcel_id}`",
+                f"**Variants tried ({len(variants)}):** "
+                + ", ".join(f"`{v}`" for v in variants),
+                "",
+                f"_No assessment record matched in the parcel layer. "
+                f"Try `find_parcel(item_id='{parcel_item_id}', "
+                f"parcel_field='Parcel_ID', parcel_id='{parcel_id}')` "
+                f"-- its LIKE fallback surfaces near-miss candidates._",
+            ])
+
+        distinct_ids = {
+            (f.get("attributes") or {}).get("Parcel_ID")
+            for f in features
+        }
+        if len(features) > 1 and len(distinct_ids) > 1:
+            lines = [
+                f"## Lot coverage: `{parcel_id}` matched "
+                f"{len(features)} parcel records",
+                "",
+                "_Multiple distinct parcels matched (typically condo "
+                "units under one root number). Condo units have no "
+                "independent lot, so coverage is not computed. Pick "
+                "one record and re-call with its exact Parcel_ID:_",
+                "",
+            ]
+            for f in features:
+                a = f.get("attributes") or {}
+                unit = a.get("Condo_Unit_Number")
+                unit_txt = f"  unit: {unit}" if unit else ""
+                lines.append(
+                    f"- `{a.get('Parcel_ID')}` -- "
+                    f"{a.get('Parcel_Address')}{unit_txt}  "
+                    f"({a.get('Land_Use')})"
+                )
+            return "\n".join(lines)
+
+        feat = features[0]
+        attrs = feat.get("attributes") or {}
+        addr = attrs.get("Parcel_Address") or "address unknown"
+        canonical_id = attrs.get("Parcel_ID") or parcel_id
+
+        try:
+            lot_sqft = float(attrs.get("Lot_Size") or 0)
+        except (TypeError, ValueError):
+            lot_sqft = 0.0
+        if lot_sqft <= 0:
+            unit = attrs.get("Condo_Unit_Number")
+            unit_txt = f" (condo unit {unit})" if unit else ""
+            return "\n".join([
+                f"## Lot coverage: `{canonical_id}` ({addr}) has no "
+                f"independent lot",
+                "",
+                f"**Land use:** {attrs.get('Land_Use')}{unit_txt}  |  "
+                f"**Lot_Size:** {attrs.get('Lot_Size')!r}",
+                "",
+                "_The assessor records no lot area for this parcel "
+                "(typical for condo units and some leases), so lot "
+                "coverage and ADU headroom are undefined for it. For "
+                "a condo, the buildable envelope belongs to the "
+                "common-interest parcel, not the unit._",
+            ])
+
+        geom = feat.get("geometry") or {}
+        rings = geom.get("rings") or []
+        if not rings:
+            raise ValueError(
+                f"Parcel {canonical_id} has no polygon geometry in "
+                f"the parcel layer, so buildings cannot be joined."
+            )
+
+        # Spatial join: buildings intersecting the parcel polygon.
+        # Both filter and output stay in EPSG:3338 -- the filter via
+        # inSR, the geometry via outSR -- so the clip below runs in an
+        # equal-area SR and planar area ≈ true ground area.
+        bldg_item_id = self.plugin_config.buildings_item_id
+        bldg_url = await self._resolve_layer_url(bldg_item_id)
+        esri_filter = json.dumps(
+            {"rings": rings, "spatialReference": {"wkid": 3338}},
+            separators=(",", ":"),
+        )
+        bldg_feats = await self._paged_geojson_fetch(
+            bldg_url,
+            where="1=1",
+            out_fields="OBJECTID,Category",
+            limit=self.FOOTPRINT_BUILDING_LIMIT,
+            method="post",
+            extra_params={
+                "geometry": esri_filter,
+                "geometryType": "esriGeometryPolygon",
+                "inSR": "3338",
+                "spatialRel": "esriSpatialRelIntersects",
+                "outSR": "3338",
+                # Override the pager's degree-based simplification:
+                # 0 = full-detail geometry (units here are meters).
+                "maxAllowableOffset": "0",
+            },
+        )
+
+        # Clip every building to the lot line and take the UNION area
+        # (one Execute over all buildings; per-building areas are for
+        # the count/detail only, where clip slivers are excluded).
+        parcel_paths = self._esri_rings_to_clipper_paths(rings)
+        if not parcel_paths:
+            raise ValueError(
+                f"Parcel {canonical_id} geometry has no usable rings."
+            )
+        all_paths: List[List[Tuple[int, int]]] = []
+        building_count = 0
+        for f in bldg_feats:
+            bpaths = self._geojson_to_clipper_paths(
+                f.get("geometry") or {}
+            )
+            if not bpaths:
+                continue
+            clipped = self._clip_intersection_area_m2(
+                bpaths, parcel_paths
+            )
+            if clipped >= self.FOOTPRINT_COUNT_MIN_M2:
+                building_count += 1
+            all_paths.extend(bpaths)
+        footprint_m2 = self._clip_intersection_area_m2(
+            all_paths, parcel_paths
+        )
+        footprint_sqft = footprint_m2 * self.M2_TO_SQFT
+        coverage = footprint_sqft / lot_sqft
+
+        # Cross-check the assessor Lot_Size against the mapped polygon.
+        # Esri ring convention: outer CW (negative shoelace), holes CCW,
+        # so the signed sum nets holes out; abs() gives the area.
+        parcel_geom_sqft = (
+            abs(sum(self._ring_area(r) for r in rings))
+            * self.M2_TO_SQFT
+        )
+
+        zone_raw = attrs.get("Zoning_District")
+        base_zone, code_area = self._normalize_zoning_district(zone_raw)
+        bowl_cap = self.LOT_COVERAGE_CAPS.get(base_zone)
+        cap: Optional[float] = None
+        cap_note = ""
+        if code_area != "bowl":
+            table = (
+                "AMC ch. 21.10 (Chugiak-Eagle River)"
+                if code_area == "chugiak-eagle river"
+                else "AMC ch. 21.09 (Girdwood)"
+            )
+            cap_note = (
+                f"zoning `{zone_raw}` is a {code_area.title()} "
+                f"district -- verify its cap in {table}"
+            )
+            if bowl_cap is not None:
+                cap_note += (
+                    f"; the Bowl table value for {base_zone} would be "
+                    f"{bowl_cap:.0%} but does not automatically apply"
+                )
+        elif base_zone in self.LOT_COVERAGE_UNRESTRICTED:
+            cap_note = (
+                f"{base_zone} has no maximum lot coverage in Table "
+                f"21.06-1 (unrestricted)"
+            )
+        elif bowl_cap is not None:
+            cap = bowl_cap
+        else:
+            cap_note = (
+                f"district `{zone_raw}` is not in the residential "
+                f"Table 21.06-1 snapshot -- no cap applied"
+            )
+
+        max_footprint_sqft: Optional[float] = None
+        headroom_sqft: Optional[float] = None
+        if cap is not None:
+            max_footprint_sqft = lot_sqft * cap
+            headroom_sqft = max_footprint_sqft - footprint_sqft
+
+        note3_applies = (
+            code_area == "bowl"
+            and base_zone in self.LOT_COVERAGE_NOTE3_DISTRICTS
+            and lot_sqft < self.NOTE3_LOT_SQFT
+        )
+        headroom_note3: Optional[float] = None
+        if note3_applies:
+            headroom_note3 = lot_sqft * self.NOTE3_CAP - footprint_sqft
+
+        caveats = [
+            "_Footprint is building polygons **clipped to the parcel** "
+            "and unioned (shared attached-housing polygons are not "
+            "dumped whole onto one lot); areas computed in EPSG:3338 "
+            "(equal-area), never from Web-Mercator `Shape__Area`._",
+            "_Headroom is the **footprint** envelope under the "
+            "coverage cap only. Setbacks and the ADU floor-area cap "
+            "(AMC 21.05.070D.1: greater of 900 sqft or 40% of the "
+            "principal dwelling's floor area, max 1,200 sqft) are "
+            "separate constraints -- footprint headroom alone does "
+            "not mean an ADU fits._",
+        ]
+        if note3_applies:
+            caveats.append(
+                "_The note-3 50% figure is **conditional**: it "
+                "requires the principal structure to be under 16 ft "
+                "tall, which cannot be verified from GIS data "
+                "(`ELEVATION` on the buildings layer is ground "
+                "elevation, not height)._"
+            )
+        if cap_note:
+            caveats.append(f"_Cap: {cap_note}._")
+        if lot_sqft > 0 and abs(parcel_geom_sqft - lot_sqft) > (
+            0.15 * lot_sqft
+        ):
+            caveats.append(
+                f"_The mapped parcel polygon measures "
+                f"{parcel_geom_sqft:,.0f} sqft vs the assessor "
+                f"Lot_Size of {lot_sqft:,.0f} sqft (>15% apart). "
+                f"Coverage uses the assessor figure; treat results "
+                f"with care._"
+            )
+        if len(bldg_feats) >= self.FOOTPRINT_BUILDING_LIMIT:
+            caveats.append(
+                f"_Hit the {self.FOOTPRINT_BUILDING_LIMIT}-building "
+                f"fetch cap; the footprint may be undercounted._"
+            )
+
+        payload: Dict[str, Any] = {
+            "parcel_id": canonical_id,
+            "address": addr,
+            "zoning_district": zone_raw,
+            "zoning_district_base": base_zone,
+            "land_use": attrs.get("Land_Use"),
+            "total_living_units": attrs.get("Total_Living_Units"),
+            "lot_size_sqft": round(lot_sqft),
+            "existing_footprint_sqft": round(footprint_sqft),
+            "coverage_pct": round(coverage, 3),
+            "district_max_coverage": cap,
+            "max_footprint_sqft": (
+                round(max_footprint_sqft)
+                if max_footprint_sqft is not None
+                else None
+            ),
+            "adu_footprint_headroom_sqft": (
+                round(headroom_sqft) if headroom_sqft is not None else None
+            ),
+            "building_count": building_count,
+            "buildings_intersecting": len(bldg_feats),
+        }
+        if note3_applies:
+            payload["headroom_if_note3_50pct"] = round(headroom_note3)
+            payload["note3_conditional"] = (
+                "requires principal structure < 16 ft; "
+                "lot < 10,000 sqft"
+            )
+        if cap_note:
+            payload["cap_source"] = cap_note
+
+        lines = [
+            f"## Lot coverage: parcel `{canonical_id}` ({addr})",
+            f"**Zoning:** {zone_raw}  |  "
+            f"**Land use:** {attrs.get('Land_Use')}  |  "
+            f"**Living units:** {attrs.get('Total_Living_Units')}",
+            f"**Lot size (assessor):** {lot_sqft:,.0f} sqft",
+            f"**Building footprint on lot (clipped):** "
+            f"{footprint_sqft:,.0f} sqft across {building_count} "
+            f"building(s)",
+            f"**Coverage:** {coverage:.1%} of lot"
+            + (
+                f"  |  **District cap:** {cap:.0%} "
+                f"(AMC Table 21.06-1)"
+                if cap is not None
+                else "  |  **District cap:** n/a"
+            ),
+        ]
+        if max_footprint_sqft is not None:
+            lines.append(
+                f"**Max footprint at cap:** "
+                f"{max_footprint_sqft:,.0f} sqft  |  "
+                f"**Footprint headroom:** {headroom_sqft:,.0f} sqft"
+            )
+        if note3_applies:
+            lines.append(
+                f"**Conditional (note 3):** on lots < 10,000 sqft the "
+                f"cap rises to {self.NOTE3_CAP:.0%} IF the principal "
+                f"structure is < 16 ft tall -> headroom would be "
+                f"{headroom_note3:,.0f} sqft"
+            )
+        datalet = attrs.get("Parcel_ID_URL")
+        if datalet:
+            lines.append(f"**Assessor record:** {datalet}")
+        lines += [
+            "",
+            "```json",
+            json.dumps(payload, indent=1),
+            "```",
+            "",
+        ]
+        lines.extend(caveats)
+        return "\n".join(lines)
+
     async def _find_features_spanning_classifications(
         self, args: Dict[str, Any]
     ) -> str:
@@ -5878,6 +6407,41 @@ class AnchorageGISPlugin(DataPlugin):
                     ],
                 },
             ),
+            ToolDefinition(
+                name="footprint_for_parcel",
+                description=(
+                    f"Real building-footprint lot coverage and ADU "
+                    f"headroom for ONE {city} parcel. Spatially joins "
+                    f"MOA building footprints to the parcel polygon, "
+                    f"CLIPS buildings shared across attached / "
+                    f"zero-lot-line rows to the lot line, computes "
+                    f"true ground area in an equal-area projection "
+                    f"(never the distorted Web-Mercator Shape__Area), "
+                    f"and compares against the zoning district's "
+                    f"max-lot-coverage cap (AMC Table 21.06-1). Use "
+                    f"for 'what % of this lot is built', 'can an ADU "
+                    f"fit', 'how much more footprint is allowed' "
+                    f"questions. Accepts any MOA parcel ID format. "
+                    f"For bulk screening across many parcels use "
+                    f"coverage_by_polygon instead (faster but "
+                    f"centroid-based, not clipped)."
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "parcel_id": {
+                            "type": "string",
+                            "description": (
+                                "MOA parcel number in any format: "
+                                "'003-264-77', '00326477', "
+                                "'00326477000', or "
+                                "'003-264-77-000'."
+                            ),
+                        },
+                    },
+                    "required": ["parcel_id"],
+                },
+            ),
         ]
         # Every tool in this plugin is read-only and reaches out to external
         # ArcGIS services, so advertise the MCP safety hints uniformly. This
@@ -6176,6 +6740,9 @@ class AnchorageGISPlugin(DataPlugin):
                 text = await self._find_features_spanning_classifications(
                     arguments
                 )
+
+            elif tool_name == "footprint_for_parcel":
+                text = await self._footprint_for_parcel(arguments)
 
             else:
                 return ToolResult(

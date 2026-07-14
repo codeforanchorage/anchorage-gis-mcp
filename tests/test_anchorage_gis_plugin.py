@@ -109,8 +109,9 @@ class TestGetTools:
         plugin.plugin_config = AnchorageGISPluginConfig(**anchorage_config)
         tools = plugin.get_tools()
 
-        assert len(tools) == 15
+        assert len(tools) == 16
         tool_names = [t.name for t in tools]
+        assert "footprint_for_parcel" in tool_names
         assert "find_gis_content" in tool_names
         assert "browse_gallery" in tool_names
         assert "search_spatial_layers" in tool_names
@@ -4458,3 +4459,328 @@ class TestArcgisRetry:
         )
         assert out == {"ok": True}
         assert plugin.client.post.await_count == 2
+
+
+# ── footprint_for_parcel ───────────────────────────────────────────────
+
+
+def _fp_parcel_attrs(**overrides):
+    """Baseline parcel attributes for footprint_for_parcel tests.
+
+    Geometry defaults to a 20x20m square (400 m2 = ~4,306 sqft), so
+    Lot_Size=4306 keeps the mapped-vs-assessor cross-check quiet.
+    """
+    attrs = {
+        "Parcel_ID": "00326477000",
+        "GIS_ParcelNum11": "00326477000",
+        "Parcel_Address": "1820 PARKSIDE DR",
+        "Property_Type": "Residential",
+        "Land_Use": "Residential 1 Family",
+        "Total_Living_Units": 1,
+        "Lot_Size": 4306,
+        "Zoning_District": "R2D",
+        "Grid_Map": "SW1433",
+        "Condo_Unit_Number": None,
+        "Parcel_ID_URL": "https://property.muni.org/x?pin=00326477000",
+    }
+    attrs.update(overrides)
+    return attrs
+
+
+_FP_SQUARE_RINGS = [[[0, 0], [0, 20], [20, 20], [20, 0], [0, 0]]]
+
+
+def _fp_building(coords):
+    return {
+        "geometry": {"type": "Polygon", "coordinates": coords},
+        "properties": {"OBJECTID": 1, "Category": "General"},
+    }
+
+
+async def _fp_run(
+    plugin, parcel_features, bldg_features, parcel_id="00326477000"
+):
+    """Run _footprint_for_parcel with the upstream calls mocked out."""
+    with patch.object(
+        plugin,
+        "_resolve_layer_url",
+        new_callable=AsyncMock,
+        return_value="https://services2.arcgis.com/x/FeatureServer/0",
+    ), patch.object(
+        plugin,
+        "_request_json_with_retry",
+        new_callable=AsyncMock,
+        return_value={"features": parcel_features},
+    ), patch.object(
+        plugin,
+        "_paged_geojson_fetch",
+        new_callable=AsyncMock,
+        return_value=bldg_features,
+    ):
+        return await plugin._footprint_for_parcel(
+            {"parcel_id": parcel_id}
+        )
+
+
+class TestFootprintForParcel:
+    @pytest.fixture
+    def plugin(self, anchorage_config):
+        p = AnchorageGISPlugin(anchorage_config)
+        p.plugin_config = AnchorageGISPluginConfig(**anchorage_config)
+        p.client = AsyncMock()
+        return p
+
+    # -- zoning normalization / cap table --
+
+    def test_normalize_bowl_district(self):
+        assert AnchorageGISPlugin._normalize_zoning_district("R2D") == (
+            "R2D",
+            "bowl",
+        )
+
+    def test_normalize_strips_sl_suffix(self):
+        assert AnchorageGISPlugin._normalize_zoning_district("R6SL") == (
+            "R6",
+            "bowl",
+        )
+
+    def test_normalize_ce_prefix_with_hyphen_and_space(self):
+        assert AnchorageGISPlugin._normalize_zoning_district("CE-R1A") == (
+            "R1A",
+            "chugiak-eagle river",
+        )
+        assert AnchorageGISPlugin._normalize_zoning_district("CE RO") == (
+            "RO",
+            "chugiak-eagle river",
+        )
+
+    def test_normalize_girdwood_prefix(self):
+        assert AnchorageGISPlugin._normalize_zoning_district("GR1") == (
+            "R1",
+            "girdwood",
+        )
+
+    def test_normalize_r10_not_mangled_to_r1(self):
+        assert AnchorageGISPlugin._normalize_zoning_district("R10SL") == (
+            "R10",
+            "bowl",
+        )
+
+    def test_cap_table_spot_values(self):
+        caps = AnchorageGISPlugin.LOT_COVERAGE_CAPS
+        assert caps["R2D"] == 0.40
+        assert caps["R3A"] == 0.50
+        assert caps["R3"] == 0.60
+        assert caps["R8"] == 0.05
+        assert "R4A" not in caps
+        assert "R4A" in AnchorageGISPlugin.LOT_COVERAGE_UNRESTRICTED
+
+    # -- clip math (pure geometry, no mocks) --
+
+    def test_clip_building_half_inside(self):
+        parcel = AnchorageGISPlugin._esri_rings_to_clipper_paths(
+            _FP_SQUARE_RINGS
+        )
+        bldg = AnchorageGISPlugin._geojson_to_clipper_paths(
+            {
+                "type": "Polygon",
+                "coordinates": [
+                    [[-5, 0], [5, 0], [5, 10], [-5, 10], [-5, 0]]
+                ],
+            }
+        )
+        area = AnchorageGISPlugin._clip_intersection_area_m2(bldg, parcel)
+        assert area == pytest.approx(50.0, rel=1e-6)
+
+    def test_clip_building_with_hole(self):
+        parcel = AnchorageGISPlugin._esri_rings_to_clipper_paths(
+            _FP_SQUARE_RINGS
+        )
+        bldg = AnchorageGISPlugin._geojson_to_clipper_paths(
+            {
+                "type": "Polygon",
+                "coordinates": [
+                    [[2, 2], [12, 2], [12, 12], [2, 12], [2, 2]],
+                    [[5, 5], [7, 5], [7, 7], [5, 7], [5, 5]],
+                ],
+            }
+        )
+        area = AnchorageGISPlugin._clip_intersection_area_m2(bldg, parcel)
+        assert area == pytest.approx(96.0, rel=1e-6)
+
+    def test_clip_overlapping_buildings_not_double_counted(self):
+        parcel = AnchorageGISPlugin._esri_rings_to_clipper_paths(
+            _FP_SQUARE_RINGS
+        )
+        square = {
+            "type": "Polygon",
+            "coordinates": [[[2, 2], [12, 2], [12, 12], [2, 12], [2, 2]]],
+        }
+        paths = AnchorageGISPlugin._geojson_to_clipper_paths(
+            square
+        ) + AnchorageGISPlugin._geojson_to_clipper_paths(square)
+        area = AnchorageGISPlugin._clip_intersection_area_m2(paths, parcel)
+        assert area == pytest.approx(100.0, rel=1e-6)
+
+    def test_clip_building_outside_parcel_is_zero(self):
+        parcel = AnchorageGISPlugin._esri_rings_to_clipper_paths(
+            _FP_SQUARE_RINGS
+        )
+        bldg = AnchorageGISPlugin._geojson_to_clipper_paths(
+            {
+                "type": "Polygon",
+                "coordinates": [
+                    [[30, 30], [40, 30], [40, 40], [30, 40], [30, 30]]
+                ],
+            }
+        )
+        assert (
+            AnchorageGISPlugin._clip_intersection_area_m2(bldg, parcel)
+            == 0.0
+        )
+
+    # -- full flow (mocked upstream) --
+
+    @pytest.mark.asyncio
+    async def test_happy_path_numbers(self, plugin):
+        # 10x10m building fully inside the 20x20m lot: 100 m2 =
+        # 1,076.39 sqft on a 4,306 sqft lot -> 25.0% coverage, R2D cap
+        # 40% -> max 1,722 sqft, headroom ~646 sqft; note 3 applies.
+        text = await _fp_run(
+            plugin,
+            [
+                {
+                    "attributes": _fp_parcel_attrs(),
+                    "geometry": {"rings": _FP_SQUARE_RINGS},
+                }
+            ],
+            [
+                _fp_building(
+                    [[[5, 5], [15, 5], [15, 15], [5, 15], [5, 5]]]
+                )
+            ],
+        )
+        assert '"existing_footprint_sqft": 1076' in text
+        assert '"coverage_pct": 0.25' in text
+        assert '"district_max_coverage": 0.4' in text
+        assert '"max_footprint_sqft": 1722' in text
+        assert '"adu_footprint_headroom_sqft": 646' in text
+        assert '"building_count": 1' in text
+        # note 3: 50% of 4,306 = 2,153 - 1,076 = 1,077
+        assert '"headroom_if_note3_50pct": 1077' in text
+        assert "Shape__Area" in text  # caveat present
+
+    @pytest.mark.asyncio
+    async def test_shared_building_clipped_to_lot(self, plugin):
+        # Attached-housing shape: the building polygon extends far
+        # beyond the lot; only the on-lot part (10x20=200 m2) counts.
+        text = await _fp_run(
+            plugin,
+            [
+                {
+                    "attributes": _fp_parcel_attrs(),
+                    "geometry": {"rings": _FP_SQUARE_RINGS},
+                }
+            ],
+            [
+                _fp_building(
+                    [[[10, -50], [80, -50], [80, 70], [10, 70], [10, -50]]]
+                )
+            ],
+        )
+        # 200 m2 = 2,152.78 sqft, NOT the whole 8,400 m2 building.
+        assert '"existing_footprint_sqft": 2153' in text
+        assert '"coverage_pct": 0.5' in text
+
+    @pytest.mark.asyncio
+    async def test_not_found(self, plugin):
+        text = await _fp_run(plugin, [], [], parcel_id="999-999-99")
+        assert "no parcel found" in text
+        assert "find_parcel" in text
+
+    @pytest.mark.asyncio
+    async def test_multiple_distinct_parcels_listed_not_computed(
+        self, plugin
+    ):
+        feats = [
+            {
+                "attributes": _fp_parcel_attrs(
+                    Parcel_ID=f"0032647700{i}", Condo_Unit_Number=str(i)
+                ),
+                "geometry": {"rings": _FP_SQUARE_RINGS},
+            }
+            for i in (1, 2)
+        ]
+        text = await _fp_run(plugin, feats, [])
+        assert "matched 2 parcel records" in text
+        assert "coverage_pct" not in text
+
+    @pytest.mark.asyncio
+    async def test_no_lot_size_clean_response(self, plugin):
+        feats = [
+            {
+                "attributes": _fp_parcel_attrs(
+                    Lot_Size=0, Condo_Unit_Number="4B"
+                ),
+                "geometry": {"rings": _FP_SQUARE_RINGS},
+            }
+        ]
+        text = await _fp_run(plugin, feats, [])
+        assert "no independent lot" in text
+        assert "coverage_pct" not in text
+
+    @pytest.mark.asyncio
+    async def test_ce_district_cap_not_assumed(self, plugin):
+        feats = [
+            {
+                "attributes": _fp_parcel_attrs(Zoning_District="CER2M"),
+                "geometry": {"rings": _FP_SQUARE_RINGS},
+            }
+        ]
+        text = await _fp_run(
+            plugin,
+            feats,
+            [_fp_building([[[5, 5], [15, 5], [15, 15], [5, 15], [5, 5]]])],
+        )
+        assert '"district_max_coverage": null' in text
+        assert "21.10" in text
+        assert '"coverage_pct": 0.25' in text  # coverage still computed
+
+    @pytest.mark.asyncio
+    async def test_r4a_unrestricted_skips_headroom(self, plugin):
+        feats = [
+            {
+                "attributes": _fp_parcel_attrs(Zoning_District="R4A"),
+                "geometry": {"rings": _FP_SQUARE_RINGS},
+            }
+        ]
+        text = await _fp_run(
+            plugin,
+            feats,
+            [_fp_building([[[5, 5], [15, 5], [15, 15], [5, 15], [5, 5]]])],
+        )
+        assert '"district_max_coverage": null' in text
+        assert '"adu_footprint_headroom_sqft": null' in text
+        assert "unrestricted" in text
+
+    @pytest.mark.asyncio
+    async def test_missing_parcel_id_errors(self, plugin):
+        result = await plugin.execute_tool("footprint_for_parcel", {})
+        assert result.success is False
+        assert "parcel_id is required" in result.error_message
+
+    @pytest.mark.asyncio
+    async def test_lot_size_geometry_mismatch_caveat(self, plugin):
+        feats = [
+            {
+                # 20x20m = ~4,306 sqft mapped, assessor says 10,000.
+                "attributes": _fp_parcel_attrs(Lot_Size=10000),
+                "geometry": {"rings": _FP_SQUARE_RINGS},
+            }
+        ]
+        text = await _fp_run(
+            plugin,
+            feats,
+            [_fp_building([[[5, 5], [15, 5], [15, 15], [5, 15], [5, 5]]])],
+        )
+        assert ">15% apart" in text

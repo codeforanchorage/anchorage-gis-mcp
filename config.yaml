@@ -63,6 +63,20 @@ instructions: |
        max_coverage_pct=40). Report the in-band count; note the 0%-coverage
        (vacant) and layer-extent caveats it surfaces.
 
+  Single-parcel lot coverage / ADU questions:
+  - "What % of THIS lot is built?", "can an ADU fit on parcel X?", "how
+    much more footprint is allowed at <address>?" is ONE call:
+    footprint_for_parcel(parcel_id=...). It accepts any MOA parcel-ID
+    format, clips buildings shared across attached/zero-lot-line rows to
+    the lot line, and returns true coverage, the district's max-coverage
+    cap, and the footprint headroom under it (plus the conditional 50%
+    small-lot figure). If you only have an address, first resolve it to a
+    Parcel_ID (query the parcel layer on Parcel_Address). Use
+    coverage_by_polygon only for BULK screening across many parcels;
+    footprint_for_parcel is the accurate single-parcel answer. Report its
+    caveats: headroom is a footprint envelope -- setbacks and the ADU
+    floor-area cap are separate constraints.
+
   All tools are READ-ONLY and safe to call without confirmation.
 
 plugins:

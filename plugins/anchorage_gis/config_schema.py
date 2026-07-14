@@ -31,6 +31,20 @@ class AnchorageGISPluginConfig(BaseModel):
     timeout: int = Field(
         default=30, ge=1, le=300, description="HTTP request timeout in seconds"
     )
+    property_item_id: str = Field(
+        default="57d6ff611f444d75a1bf2b4a1d340163",
+        description=(
+            "Portal item ID of the assessor parcel layer "
+            "(PropertyInformation_Hosted) used by footprint_for_parcel"
+        ),
+    )
+    buildings_item_id: str = Field(
+        default="56d274594cbc4aa8bac4257edd06d6cf",
+        description=(
+            "Portal item ID of the building-footprints layer "
+            "(Buildings_Hosted) used by footprint_for_parcel"
+        ),
+    )
 
     @field_validator("portal_base_url")
     @classmethod
