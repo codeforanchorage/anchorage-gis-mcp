@@ -15,6 +15,15 @@ terraform {
 
 provider "aws" {
   region = var.aws_region
+
+  # Fleet cost-allocation tag: the account's mcp-fleet-monthly AWS Budget
+  # filters on Project=mcp-server, so untagged resources are invisible to
+  # it. default_tags stamps every taggable resource in this stack.
+  default_tags {
+    tags = {
+      Project = "mcp-server"
+    }
+  }
 }
 
 # Read config.yaml

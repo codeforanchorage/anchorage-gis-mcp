@@ -8,19 +8,32 @@ config_file = "config.yaml"
 lambda_memory   = 1024
 lambda_timeout  = 120
 api_quota_limit = 3000
-api_rate_limit  = 5
-api_burst_limit = 10
+# Rate/burst feed BOTH the stage-wide throttle (the aggregate cap on the
+# keyless public /mcp) and the usage-plan throttle (API-key traffic).
+# ESRI UC WEEK POSTURE (raised 2026-07-13 for conference traffic; see
+# docs/RUNBOOK.md): 20 rps / 40 burst. Steady-state values: 5 / 10.
+api_rate_limit  = 20
+api_burst_limit = 40
 custom_domain   = "anchorage-gis.codeforanchorage.org"
 
 # Cap concurrent Lambda executions. Cost and blast-radius protection if
 # WAF is bypassed via distributed sources. Conversational MCP traffic does
 # not need horizontal scale; raise if legitimate users start getting throttled.
-lambda_reserved_concurrency = 10
+# ESRI UC WEEK POSTURE: 25 (steady-state: 10). Bounds worst-case Lambda
+# spend to ~25 GB-s/s ~= $36/day even at full saturation.
+lambda_reserved_concurrency = 25
 
 # WAF per-IP rate limit (rolling 5-minute window). The MCP tools are
 # conversational, so 1 rps sustained per IP (~300/5min) is plenty for
 # real users and tight enough to slow scrapers and denial-of-wallet probes.
-waf_rate_limit_per_5min = 300
+# NOTE: ALL claude.ai users share ~5 Anthropic egress IPs (160.79.106.32/27),
+# so this per-IP limit is effectively an aggregate cap on claude.ai traffic.
+# ESRI UC WEEK POSTURE: 600 (steady-state: 300).
+waf_rate_limit_per_5min = 600
+
+# CloudWatch alarms (errors, throttles, 5xx, probing, duration) notify this
+# topic; email subscription on it. Empty string = alarms are dashboard-only.
+alarm_sns_topic_arn = "arn:aws:sns:us-west-2:420839047325:anchorage-gis-mcp-prod-alarms"
 
 # Hardened, API-key-gated /mcp-gcc route for an M365 GCC Copilot consumer.
 # Kept enabled. The Copilot Studio connector isn't wired up yet, but the route

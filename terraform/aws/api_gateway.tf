@@ -204,14 +204,17 @@ resource "aws_api_gateway_stage" "prod" {
 }
 
 # Method Settings: Throttling for all methods in stage (AWS format: */* not /*/*)
+# This stage-wide throttle is the aggregate hard cap for the KEYLESS public
+# /mcp route (the usage-plan throttle below only binds API-key traffic), so
+# it takes the same vars -- tune both in tfvars, not here.
 resource "aws_api_gateway_method_settings" "mcp_post" {
   rest_api_id = aws_api_gateway_rest_api.mcp_api.id
   stage_name  = aws_api_gateway_stage.prod.stage_name
   method_path = "*/*"
 
   settings {
-    throttling_burst_limit = 10
-    throttling_rate_limit  = 5
+    throttling_burst_limit = var.api_burst_limit
+    throttling_rate_limit  = var.api_rate_limit
   }
 }
 
