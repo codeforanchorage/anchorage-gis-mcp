@@ -310,6 +310,38 @@ class TestWhereValidator:
         result = WhereValidator.validate("deleted_at IS NULL")
         assert result == "deleted_at IS NULL"
 
+    # Quote-awareness: forbidden tokens inside quoted string literals
+    # are data, not SQL (real Anchorage streets include Credit Union Dr)
+    # and must pass through unmodified.
+    @pytest.mark.parametrize(
+        "where",
+        [
+            "STREET_NAME LIKE '%UNION%'",
+            "Owner_Name LIKE '%O''BRIEN%'",
+            "Category = 'SHED; GARAGE'",
+            "Legal_Description LIKE '%LOT 4 -- REAR%'",
+        ],
+    )
+    def test_forbidden_tokens_inside_literals_allowed(self, where):
+        assert WhereValidator.validate(where) == where
+
+    @pytest.mark.parametrize(
+        "where",
+        [
+            "1=1 UNION SELECT 1",
+            "1=1; DROP TABLE x",
+            "1=1) UNION SELECT * FROM sysobjects --",
+            "Owner_Name = 'x' UNION SELECT 1",  # injection AFTER a literal
+        ],
+    )
+    def test_injection_outside_literals_still_rejected(self, where):
+        with pytest.raises(ValueError, match="Forbidden"):
+            WhereValidator.validate(where)
+
+    def test_unbalanced_quote_rejected(self):
+        with pytest.raises(ValueError, match="Unbalanced quote"):
+            WhereValidator.validate("Category = 'ABC")
+
 
 class TestWhereValidatorAgainstSchema:
     def test_default_where_skipped(self):
