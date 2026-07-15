@@ -355,6 +355,45 @@ class AnchorageGISPlugin(DataPlugin):
     COVERAGE_THRESHOLD = 0.5  # < 50% muni overlap -> coverage note
     SMALL_SAMPLE_THRESHOLD = 10  # total_count < 10 (and > 1) -> small-N note
 
+    # Above this many records, _format_query_results switches from
+    # per-record blocks to a compact pipe-delimited table -- the block
+    # format costs ~3x the bytes of the data it carries. Results that
+    # carry geometry keep the block format: a multi-hundred-char
+    # GeoJSON cell would dominate any table row.
+    COMPACT_FORMAT_THRESHOLD = 20
+
+    def _render_field_value(
+        self,
+        key: str,
+        value: Any,
+        date_fields: Optional[set],
+        coded_domains: Optional[Dict[str, Dict[Any, str]]],
+    ) -> Any:
+        """Date + coded-domain rendering shared by the per-record block
+        and compact table formats."""
+        if date_fields and key in date_fields and value is not None:
+            return self._ms_to_iso_smart(value)
+        if (
+            coded_domains
+            and key in coded_domains
+            and value is not None
+            and value in coded_domains[key]
+        ):
+            # Render coded values as "<code> (<label>)" so the model
+            # doesn't have to guess what e.g. R1A means. Skip the
+            # parenthetical when code and label are the same string to
+            # avoid noise like "Status: Open (Open)".
+            label = coded_domains[key][value]
+            if str(value) != str(label):
+                return f"{value} ({label})"
+        return value
+
+    @staticmethod
+    def _table_cell(value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).replace("|", "\\|")
+
     def _format_query_results(
         self,
         records: List[Dict[str, Any]],
@@ -527,42 +566,69 @@ class AnchorageGISPlugin(DataPlugin):
                 f"named entities, call {follow_up}."
             )
         lines.append("")
-        for i, record in enumerate(records, 1):
-            lines.append(f"Record {i}:")
-            geometry = record.get("__geometry__")
-            for key, value in record.items():
-                if key == "__geometry__":
-                    continue
-                if date_fields and key in date_fields and value is not None:
-                    value = self._ms_to_iso_smart(value)
-                elif (
-                    coded_domains
-                    and key in coded_domains
-                    and value is not None
-                    and value in coded_domains[key]
-                ):
-                    # Render coded values as "<code> (<label>)" so the
-                    # model doesn't have to guess what e.g. R1A means.
-                    # Skip the parenthetical when code and label are
-                    # the same string to avoid noise like
-                    # "Status: Open (Open)".
-                    label = coded_domains[key][value]
-                    if str(value) != str(label):
-                        value = f"{value} ({label})"
-                lines.append(f"  {key}: {value}")
-            if geometry is not None:
-                geom_str = json.dumps(geometry, separators=(",", ":"))
-                if len(geom_str) > self.GEOMETRY_STR_MAX:
-                    geom_clip = geom_str[: self.GEOMETRY_STR_MAX]
-                    geom_str = (
-                        f"{geom_clip}... "
-                        f"(truncated, {len(geom_str)} chars total; "
-                        f"server-side simplified to "
-                        f"~{self.GEOMETRY_SIMPLIFY_OFFSET_DEG} deg "
-                        f"~ 5.5m)"
+        has_geometry = any(
+            record.get("__geometry__") is not None for record in records
+        )
+        if (
+            len(records) > self.COMPACT_FORMAT_THRESHOLD
+            and not has_geometry
+        ):
+            # Large result sets: pipe-delimited table (header row + one
+            # row per record) instead of per-record blocks, which cost
+            # ~3x the bytes of the data they carry.
+            columns: List[str] = []
+            seen = set()
+            for record in records:
+                for key in record:
+                    if key != "__geometry__" and key not in seen:
+                        seen.add(key)
+                        columns.append(key)
+            lines.append(
+                f"(Compact format: {len(records)} records, one "
+                f"pipe-delimited row each; the first row is the header.)"
+            )
+            lines.append(" | ".join(columns))
+            for record in records:
+                lines.append(
+                    " | ".join(
+                        self._table_cell(
+                            self._render_field_value(
+                                k,
+                                record.get(k),
+                                date_fields,
+                                coded_domains,
+                            )
+                        )
+                        for k in columns
                     )
-                lines.append(f"  geometry (GeoJSON, WGS84): {geom_str}")
+                )
             lines.append("")
+        else:
+            for i, record in enumerate(records, 1):
+                lines.append(f"Record {i}:")
+                geometry = record.get("__geometry__")
+                for key, value in record.items():
+                    if key == "__geometry__":
+                        continue
+                    value = self._render_field_value(
+                        key, value, date_fields, coded_domains
+                    )
+                    lines.append(f"  {key}: {value}")
+                if geometry is not None:
+                    geom_str = json.dumps(geometry, separators=(",", ":"))
+                    if len(geom_str) > self.GEOMETRY_STR_MAX:
+                        geom_clip = geom_str[: self.GEOMETRY_STR_MAX]
+                        geom_str = (
+                            f"{geom_clip}... "
+                            f"(truncated, {len(geom_str)} chars total; "
+                            f"server-side simplified to "
+                            f"~{self.GEOMETRY_SIMPLIFY_OFFSET_DEG} deg "
+                            f"~ 5.5m)"
+                        )
+                    lines.append(
+                        f"  geometry (GeoJSON, WGS84): {geom_str}"
+                    )
+                lines.append("")
         # The TRUNCATED banner and TOTAL COUNT line above already carry
         # the sampling caveat. Copilot (now GPT-5.1) and Claude both read
         # the full response top-down, so the older bottom-of-response

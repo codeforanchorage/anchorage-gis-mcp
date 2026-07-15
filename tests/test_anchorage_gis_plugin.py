@@ -2429,6 +2429,96 @@ class TestFormatters:
         assert "LIMITED" not in text
 
 
+class TestCompactRecordFormat:
+    """Above COMPACT_FORMAT_THRESHOLD records, the formatter switches
+    from per-record blocks to a pipe-delimited table -- the block
+    format costs ~3x the bytes of the data it carries."""
+
+    @pytest.fixture
+    def plugin(self, anchorage_config):
+        p = AnchorageGISPlugin(anchorage_config)
+        p.plugin_config = AnchorageGISPluginConfig(**anchorage_config)
+        return p
+
+    def test_large_result_uses_pipe_table(self, plugin):
+        n = AnchorageGISPlugin.COMPACT_FORMAT_THRESHOLD + 5
+        records = [
+            {"OBJECTID": i, "NAME": f"Feature {i}"} for i in range(n)
+        ]
+        text = plugin._format_query_results(
+            records,
+            limit=50,
+            total_count=n,
+            service_url="https://example.com/FeatureServer/0",
+            where="1=1",
+        )
+        assert "Record 1:" not in text
+        # Header row lists the columns in record order.
+        assert "OBJECTID | NAME" in text
+        assert "Feature 0" in text
+        assert f"Feature {n - 1}" in text
+        # Provenance and count conventions are untouched.
+        assert text.startswith("Source: ")
+        assert "TOTAL COUNT" in text
+
+    def test_small_result_keeps_record_blocks(self, plugin):
+        records = [{"OBJECTID": 1}, {"OBJECTID": 2}]
+        text = plugin._format_query_results(
+            records, limit=50, total_count=2
+        )
+        assert "Record 1:" in text
+        assert "Record 2:" in text
+
+    def test_geometry_records_keep_blocks(self, plugin):
+        # Geometry-bearing results stay in block format: a GeoJSON
+        # table cell would dominate any row.
+        n = AnchorageGISPlugin.COMPACT_FORMAT_THRESHOLD + 5
+        records = [
+            {
+                "OBJECTID": i,
+                "__geometry__": {
+                    "type": "Point",
+                    "coordinates": [-149.9, 61.2],
+                },
+            }
+            for i in range(n)
+        ]
+        text = plugin._format_query_results(records, limit=50)
+        assert "Record 1:" in text
+        assert "geometry (GeoJSON, WGS84)" in text
+
+    def test_compact_applies_dates_and_domains(self, plugin):
+        # The compact path must render dates and coded-domain labels
+        # the same way the block path does.
+        n = AnchorageGISPlugin.COMPACT_FORMAT_THRESHOLD + 1
+        records = [
+            {"OBJECTID": i, "EDITED": 1700000000000, "ZONE": "R1A"}
+            for i in range(n)
+        ]
+        text = plugin._format_query_results(
+            records,
+            limit=50,
+            date_fields={"EDITED"},
+            coded_domains={"ZONE": {"R1A": "Single Family"}},
+        )
+        assert "Record 1:" not in text
+        assert "2023-11-14" in text
+        assert "R1A (Single Family)" in text
+
+    def test_pipe_in_value_is_escaped(self, plugin):
+        assert plugin._table_cell("A | B") == "A \\| B"
+        assert plugin._table_cell(None) == ""
+
+    def test_missing_key_renders_empty_cell(self, plugin):
+        # Records with heterogeneous keys: the column union is used
+        # and absent values render as empty cells, not 'None'.
+        n = AnchorageGISPlugin.COMPACT_FORMAT_THRESHOLD + 1
+        records = [{"A": 1} if i % 2 else {"A": 1, "B": 2} for i in range(n)]
+        text = plugin._format_query_results(records, limit=50)
+        assert "A | B" in text
+        assert "None" not in text
+
+
 class TestAnchorageCoveragePct:
     def test_wgs84_full_overlap(self):
         # Bbox exactly the muni — coverage close to 1.0.
@@ -2685,6 +2775,74 @@ class TestGetDistinctValues:
         assert "%2M%" in captured_params["where"]
         # ArcGIS distinct-values flag must be on.
         assert captured_params["returnDistinctValues"] == "true"
+
+    @pytest.mark.asyncio
+    async def test_union_inside_string_literal_allowed(self, plugin):
+        """Regression: UNION inside a quoted literal is data, not SQL.
+        The live-probe repro was get_distinct_values on Buildings with
+        where="... LIKE '%UNION%'" -> "Forbidden keyword 'UNION'"."""
+        where = "STREET_NAME LIKE '%UNION%'"
+        captured_params = {}
+
+        with patch.object(
+            plugin,
+            "_resolve_layer_url",
+            new_callable=AsyncMock,
+            return_value="https://example.com/FeatureServer/0",
+        ), patch.object(
+            plugin,
+            "_fetch_layer_meta",
+            new_callable=AsyncMock,
+            return_value={
+                "fields": [
+                    {"name": "STREET_NAME"},
+                    {"name": "Category"},
+                ]
+            },
+        ):
+            async def fake_get(url, params=None):
+                captured_params.update(params or {})
+                resp = Mock()
+                resp.status_code = 200
+                resp.raise_for_status = Mock()
+                resp.json.return_value = {
+                    "features": [
+                        {"attributes": {"Category": "COMMERCIAL"}}
+                    ]
+                }
+                return resp
+
+            plugin.client = Mock()
+            plugin.client.get = fake_get
+            text = await plugin._get_distinct_values({
+                "item_id": "a" * 32,
+                "field": "Category",
+                "where": where,
+            })
+
+        assert "COMMERCIAL" in text
+        # The ORIGINAL clause (not a masked copy) is forwarded upstream.
+        assert captured_params["where"] == where
+
+    @pytest.mark.asyncio
+    async def test_injection_where_still_rejected(self, plugin):
+        with patch.object(
+            plugin,
+            "_resolve_layer_url",
+            new_callable=AsyncMock,
+            return_value="https://example.com/FeatureServer/0",
+        ), patch.object(
+            plugin,
+            "_fetch_layer_meta",
+            new_callable=AsyncMock,
+            return_value={"fields": [{"name": "Category"}]},
+        ):
+            with pytest.raises(ValueError, match="Forbidden keyword"):
+                await plugin._get_distinct_values({
+                    "item_id": "a" * 32,
+                    "field": "Category",
+                    "where": "1=1 UNION SELECT 1",
+                })
 
     @pytest.mark.asyncio
     async def test_unknown_field_names_recovery_call(self, plugin):
