@@ -41,3 +41,14 @@ alarm_sns_topic_arn = "arn:aws:sns:us-west-2:420839047325:anchorage-gis-mcp-prod
 # + instructions also ship on the public /mcp route, same Lambda.) Retrieve the
 # key with: terraform output -raw gcc_api_key_value
 enable_gcc_route = true
+
+# Use the fleet-wide WAF instead of a dedicated ACL for this MCP. A dedicated
+# ACL costs ~$8/mo in fixed AWS charges regardless of traffic; the shared ACL
+# keeps this MCP's 600/5min limit as its own counter, aggregated on
+# (IP, Host) so it stays independent of the other MCPs sharing that limit.
+#
+# The effective limit now lives in mcp-stats' `fleet_waf_members` under the key
+# `anchorage-gis` — change it there, not here. The rate-limit value above is retained
+# so that rolling back (use_shared_waf = false) restores the original limit.
+# See mcp-stats/docs/waf-consolidation.md.
+use_shared_waf = true
