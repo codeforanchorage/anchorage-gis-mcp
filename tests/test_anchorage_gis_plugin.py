@@ -1314,7 +1314,7 @@ class TestFilterByPolygon:
             "spatial_query_polygon",
             new_callable=AsyncMock,
         ) as sqp_mock:
-            text = await plugin._filter_by_polygon(
+            text, _ = await plugin._filter_by_polygon(
                 {
                     "source_item_id": _SOURCE_ID,
                     "container_item_id": _CONTAINER_ID,
@@ -1353,7 +1353,7 @@ class TestFilterByPolygon:
                 {"id": 2, "desc": "Public camp report B"},
             ],
         ) as sqp_mock:
-            text = await plugin._filter_by_polygon(
+            text, _ = await plugin._filter_by_polygon(
                 {
                     "source_item_id": _SOURCE_ID,
                     "container_item_id": _CONTAINER_ID,
@@ -1395,7 +1395,7 @@ class TestFilterByPolygon:
             new_callable=AsyncMock,
             return_value=[{"id": 1}],
         ) as sqp_mock:
-            text = await plugin._filter_by_polygon(
+            text, _ = await plugin._filter_by_polygon(
                 {
                     "source_item_id": _SOURCE_ID,
                     "container_item_id": _CONTAINER_ID,
@@ -2242,7 +2242,7 @@ class TestFormatters:
         plugin.plugin_config = AnchorageGISPluginConfig(**anchorage_config)
 
         records = [{"OBJECTID": 1, "TRAIL_NAME": "Coastal Trail"}]
-        text = plugin._format_query_results(
+        text, _ = plugin._format_query_results(
             records,
             limit=1,
             total_count=1123,
@@ -2271,7 +2271,7 @@ class TestFormatters:
         plugin.plugin_config = AnchorageGISPluginConfig(**anchorage_config)
 
         records = [{"OBJECTID": 1, "Name": "Town Square Park"}]
-        text = plugin._format_query_results(
+        text, _ = plugin._format_query_results(
             records,
             limit=1,
             total_count=318,
@@ -2291,7 +2291,7 @@ class TestFormatters:
         plugin.plugin_config = AnchorageGISPluginConfig(**anchorage_config)
 
         records = [{"OBJECTID": 1, "TRAIL_NAME": "Coastal Trail"}]
-        text = plugin._format_query_results(
+        text, _ = plugin._format_query_results(
             records,
             limit=1,
             total_count=None,  # no count requested
@@ -2316,7 +2316,7 @@ class TestFormatters:
                 },
             }
         ]
-        text = plugin._format_query_results(records, limit=50)
+        text, _ = plugin._format_query_results(records, limit=50)
         assert "Kincaid Park" in text
         assert "geometry (GeoJSON, WGS84)" in text
         assert "Polygon" in text
@@ -2340,14 +2340,14 @@ class TestFormatters:
                 },
             }
         ]
-        text = plugin._format_query_results(records, limit=50)
+        text, _ = plugin._format_query_results(records, limit=50)
         assert "truncated" in text
         assert "chars total" in text
 
     def test_single_record_caveat(self, anchorage_config):
         plugin = AnchorageGISPlugin(anchorage_config)
         plugin.plugin_config = AnchorageGISPluginConfig(**anchorage_config)
-        text = plugin._format_query_results(
+        text, _ = plugin._format_query_results(
             [{"OBJECTID": 1, "X": "y"}],
             limit=10,
             total_count=1,
@@ -2358,7 +2358,7 @@ class TestFormatters:
     def test_small_sample_caveat(self, anchorage_config):
         plugin = AnchorageGISPlugin(anchorage_config)
         plugin.plugin_config = AnchorageGISPluginConfig(**anchorage_config)
-        text = plugin._format_query_results(
+        text, _ = plugin._format_query_results(
             [{"OBJECTID": i} for i in range(1, 6)],
             limit=10,
             total_count=5,
@@ -2371,7 +2371,7 @@ class TestFormatters:
     def test_no_caveat_at_threshold(self, anchorage_config):
         plugin = AnchorageGISPlugin(anchorage_config)
         plugin.plugin_config = AnchorageGISPluginConfig(**anchorage_config)
-        text = plugin._format_query_results(
+        text, _ = plugin._format_query_results(
             [{"OBJECTID": i} for i in range(1, 11)],
             limit=10,
             total_count=10,
@@ -2386,7 +2386,7 @@ class TestFormatters:
         from datetime import datetime, timezone, timedelta
         old_dt = datetime.now(timezone.utc) - timedelta(days=3 * 365)
         last_edit_ms = int(old_dt.timestamp() * 1000)
-        text = plugin._format_query_results(
+        text, _ = plugin._format_query_results(
             [{"OBJECTID": 1}],
             limit=1,
             total_count=500,
@@ -2403,7 +2403,7 @@ class TestFormatters:
             (datetime.now(timezone.utc) - timedelta(days=30))
             .timestamp() * 1000
         )
-        text = plugin._format_query_results(
+        text, _ = plugin._format_query_results(
             [{"OBJECTID": 1}],
             limit=1,
             total_count=500,
@@ -2414,7 +2414,7 @@ class TestFormatters:
     def test_coverage_caveat_partial(self, anchorage_config):
         plugin = AnchorageGISPlugin(anchorage_config)
         plugin.plugin_config = AnchorageGISPluginConfig(**anchorage_config)
-        text = plugin._format_query_results(
+        text, _ = plugin._format_query_results(
             [{"OBJECTID": 1}],
             limit=1,
             total_count=500,
@@ -2426,7 +2426,7 @@ class TestFormatters:
     def test_coverage_caveat_zero_overlap(self, anchorage_config):
         plugin = AnchorageGISPlugin(anchorage_config)
         plugin.plugin_config = AnchorageGISPluginConfig(**anchorage_config)
-        text = plugin._format_query_results(
+        text, _ = plugin._format_query_results(
             [{"OBJECTID": 1}],
             limit=1,
             total_count=500,
@@ -2438,7 +2438,7 @@ class TestFormatters:
     def test_coverage_caveat_silent_at_full(self, anchorage_config):
         plugin = AnchorageGISPlugin(anchorage_config)
         plugin.plugin_config = AnchorageGISPluginConfig(**anchorage_config)
-        text = plugin._format_query_results(
+        text, _ = plugin._format_query_results(
             [{"OBJECTID": 1}],
             limit=1,
             total_count=500,
@@ -2464,7 +2464,7 @@ class TestCompactRecordFormat:
         records = [
             {"OBJECTID": i, "NAME": f"Feature {i}"} for i in range(n)
         ]
-        text = plugin._format_query_results(
+        text, _ = plugin._format_query_results(
             records,
             limit=50,
             total_count=n,
@@ -2482,7 +2482,7 @@ class TestCompactRecordFormat:
 
     def test_small_result_keeps_record_blocks(self, plugin):
         records = [{"OBJECTID": 1}, {"OBJECTID": 2}]
-        text = plugin._format_query_results(
+        text, _ = plugin._format_query_results(
             records, limit=50, total_count=2
         )
         assert "Record 1:" in text
@@ -2502,7 +2502,7 @@ class TestCompactRecordFormat:
             }
             for i in range(n)
         ]
-        text = plugin._format_query_results(records, limit=50)
+        text, _ = plugin._format_query_results(records, limit=50)
         assert "Record 1:" in text
         assert "geometry (GeoJSON, WGS84)" in text
 
@@ -2514,7 +2514,7 @@ class TestCompactRecordFormat:
             {"OBJECTID": i, "EDITED": 1700000000000, "ZONE": "R1A"}
             for i in range(n)
         ]
-        text = plugin._format_query_results(
+        text, _ = plugin._format_query_results(
             records,
             limit=50,
             date_fields={"EDITED"},
@@ -2533,7 +2533,7 @@ class TestCompactRecordFormat:
         # and absent values render as empty cells, not 'None'.
         n = AnchorageGISPlugin.COMPACT_FORMAT_THRESHOLD + 1
         records = [{"A": 1} if i % 2 else {"A": 1, "B": 2} for i in range(n)]
-        text = plugin._format_query_results(records, limit=50)
+        text, _ = plugin._format_query_results(records, limit=50)
         assert "A | B" in text
         assert "None" not in text
 
@@ -2742,7 +2742,7 @@ class TestGetDistinctValues:
             plugin.client = AsyncMock()
             plugin.client.get = AsyncMock(return_value=mock_resp)
 
-            text = await plugin._get_distinct_values({
+            text, _ = await plugin._get_distinct_values({
                 "item_id": "a" * 32,
                 "field": "ZONE_CODE",
             })
@@ -2833,7 +2833,7 @@ class TestGetDistinctValues:
 
             plugin.client = Mock()
             plugin.client.get = fake_get
-            text = await plugin._get_distinct_values({
+            text, _ = await plugin._get_distinct_values({
                 "item_id": "a" * 32,
                 "field": "Category",
                 "where": where,
@@ -3137,7 +3137,7 @@ class TestFindFeaturesSpanningClassifications:
             plugin.client = Mock()
             plugin.client.post = fake_post
 
-            text = await plugin._find_features_spanning_classifications({
+            text, _ = await plugin._find_features_spanning_classifications({
                 "source_item_id": "a" * 32,
                 "classification_item_id": "b" * 32,
                 "classification_field": "ZONE_CODE",
@@ -3382,7 +3382,7 @@ class TestFindFeaturesSpanningClassifications:
         ):
             # Should reach the source-count branch ("0 features") not
             # the parcel-grain refusal.
-            text = await plugin._find_features_spanning_classifications(
+            text, _ = await plugin._find_features_spanning_classifications(
                 {
                     "source_item_id": "a" * 32,
                     "classification_item_id": "b" * 32,
@@ -3430,7 +3430,7 @@ class TestFindFeaturesSpanningClassifications:
             # Should NOT raise the "no user-facing identifier" error.
             # (It will fall through to the "0 features" branch which
             # returns a benign message — fine for this test.)
-            text = await plugin._find_features_spanning_classifications(
+            text, _ = await plugin._find_features_spanning_classifications(
                 {
                     "source_item_id": "a" * 32,
                     "classification_item_id": "b" * 32,
@@ -3528,7 +3528,7 @@ class TestFindFeaturesSpanningClassifications:
             plugin.client = Mock()
             plugin.client.post = fake_post
 
-            text = await plugin._find_features_spanning_classifications(
+            text, _ = await plugin._find_features_spanning_classifications(
                 {
                     "source_item_id": "a" * 32,
                     "classification_item_id": "b" * 32,
@@ -3643,7 +3643,7 @@ class TestFindFeaturesSpanningClassifications:
             plugin.client.post = fake_post
             plugin.client.get = fake_get
 
-            text = await plugin._find_features_spanning_classifications(
+            text, _ = await plugin._find_features_spanning_classifications(
                 {
                     "source_item_id": "a" * 32,
                     "classification_item_id": "b" * 32,
@@ -3744,7 +3744,7 @@ class TestFindFeaturesSpanningClassifications:
             plugin.client.post = fake_post
             plugin.client.get = fake_get
 
-            text = await plugin._find_features_spanning_classifications(
+            text, _ = await plugin._find_features_spanning_classifications(
                 {
                     "source_item_id": "a" * 32,
                     "classification_item_id": "b" * 32,
@@ -4694,9 +4694,12 @@ async def _fp_run(
         new_callable=AsyncMock,
         return_value=bldg_features,
     ):
-        return await plugin._footprint_for_parcel(
+        # Prose only: these tests assert on the rendering. The
+        # structured half is covered in test_structured_output.py.
+        text, _ = await plugin._footprint_for_parcel(
             {"parcel_id": parcel_id}
         )
+        return text
 
 
 class TestFootprintForParcel:

@@ -13,7 +13,7 @@ path gets wrong.
 """
 
 import re
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -73,7 +73,17 @@ class TestSchemasAreWellFormed:
         also returning structured_content silently breaks conformance.
         """
         declared = set(AnchorageGISPlugin.TOOL_OUTPUT_SCHEMAS)
-        assert declared == {"aggregate_by_polygon", "coverage_by_polygon"}
+        assert declared == {
+            "aggregate_by_polygon",
+            "coverage_by_polygon",
+            "query_data",
+            "spatial_query_point",
+            "spatial_query_polygon",
+            "filter_by_polygon",
+            "get_distinct_values",
+            "find_features_spanning_classifications",
+            "footprint_for_parcel",
+        }
 
         tools = {t.name: t for t in plugin.get_tools()}
         for name in declared:
@@ -438,3 +448,331 @@ class TestCoverageStructuredOutput:
         assert structured["caveats"], "expected the standing methodology notes"
         for caveat in structured["caveats"]:
             assert caveat["message"] in text
+
+
+# ── the record-listing family (shared _format_query_results) ──────────
+
+
+QR_SCHEMA = AnchorageGISPlugin.QUERY_RESULT_OUTPUT_SCHEMA
+
+
+class TestQueryResultStructuredOutput:
+    """query_data, spatial_query_point/polygon and filter_by_polygon all
+    render through _format_query_results, so they share one schema."""
+
+    def test_records_with_total_count_conform(self, plugin):
+        records = [{"Parcel_ID": "P1", "Zone": "R1"}]
+        text, structured = plugin._format_query_results(
+            records, limit=50, total_count=1234, item_id="x" * 32
+        )
+        _validate(QR_SCHEMA, structured)
+        assert structured["summary"]["total_count"] == 1234
+        assert structured["summary"]["returned"] == 1
+        assert structured["summary"]["truncated"] is True
+        assert structured["rows"][0]["Parcel_ID"] == "P1"
+
+    def test_no_records_conforms(self, plugin):
+        text, structured = plugin._format_query_results([], limit=50)
+        _validate(QR_SCHEMA, structured)
+        assert structured["rows"] == []
+        assert structured["summary"]["returned"] == 0
+
+    def test_null_total_count_conforms(self, plugin):
+        """The spatial_* tools do not paginate, so total_count is null."""
+        records = [{"A": 1}]
+        _, structured = plugin._format_query_results(
+            records, limit=50, total_count=None
+        )
+        _validate(QR_SCHEMA, structured)
+        assert structured["summary"]["total_count"] is None
+        assert structured["summary"]["truncated"] is False
+
+    def test_single_record_and_small_sample_caveats(self, plugin):
+        _, one = plugin._format_query_results(
+            [{"A": 1}], limit=50, total_count=1
+        )
+        _validate(QR_SCHEMA, one)
+        assert "single_record" in {c["code"] for c in one["caveats"]}
+
+        _, few = plugin._format_query_results(
+            [{"A": i} for i in range(3)], limit=50, total_count=3
+        )
+        _validate(QR_SCHEMA, few)
+        assert "small_sample" in {c["code"] for c in few["caveats"]}
+
+    def test_polyline_grain_caveat_is_structured(self, plugin):
+        _, structured = plugin._format_query_results(
+            [{"NAME": "Trail"}],
+            limit=50,
+            total_count=1123,
+            geometry_type="esriGeometryPolyline",
+        )
+        _validate(QR_SCHEMA, structured)
+        assert "polyline_grain" in {c["code"] for c in structured["caveats"]}
+
+    def test_coverage_caveats_are_structured(self, plugin):
+        _, none_cov = plugin._format_query_results(
+            [{"A": 1}], limit=50, coverage_pct=0.0
+        )
+        _validate(QR_SCHEMA, none_cov)
+        assert "no_coverage" in {c["code"] for c in none_cov["caveats"]}
+
+        _, low = plugin._format_query_results(
+            [{"A": 1}], limit=50, coverage_pct=0.1
+        )
+        _validate(QR_SCHEMA, low)
+        assert "limited_coverage" in {c["code"] for c in low["caveats"]}
+
+    def test_geometry_is_full_not_clipped(self, plugin):
+        """The text clips long geometry; the structured copy must not."""
+        big = {
+            "type": "Polygon",
+            "coordinates": [[[i * 0.001, i * 0.001] for i in range(3000)]],
+        }
+        records = [{"ID": 1, "__geometry__": big}]
+        text, structured = plugin._format_query_results(records, limit=50)
+        _validate(QR_SCHEMA, structured)
+        assert "truncated" in text  # the rendering clipped it
+        assert structured["rows"][0]["__geometry__"] == big
+
+    def test_coded_domains_shipped_for_decoding(self, plugin):
+        _, structured = plugin._format_query_results(
+            [{"CODE": 1}],
+            limit=50,
+            coded_domains={"CODE": {1: "Residential"}},
+        )
+        _validate(QR_SCHEMA, structured)
+        assert structured["coded_domains"]["CODE"]["1"] == "Residential"
+        # rows keep the RAW stored code, not the label
+        assert structured["rows"][0]["CODE"] == 1
+
+
+# ── get_distinct_values ───────────────────────────────────────────────
+
+
+class TestDistinctValuesStructuredOutput:
+    @staticmethod
+    def _patch(plugin, values):
+        """Stub the layer lookup and the distinct-values query.
+
+        The tool calls plugin.client.get directly (not the retrying
+        helper), so that is what has to be replaced.
+        """
+        feats = [{"attributes": {"Zone": v}} for v in values]
+        resp = MagicMock()
+        resp.json.return_value = {"features": feats}
+        resp.raise_for_status.return_value = None
+        plugin.client = MagicMock()
+        plugin.client.get = AsyncMock(return_value=resp)
+        meta = {
+            "geometryType": "esriGeometryPolygon",
+            "fields": [{"name": "Zone", "type": "esriFieldTypeString"}],
+        }
+        return (
+            patch.object(
+                plugin, "_resolve_layer_url", AsyncMock(return_value="http://x/0")
+            ),
+            patch.object(
+                plugin, "_fetch_layer_meta", AsyncMock(return_value=meta)
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_values_conform(self, plugin):
+        p1, p2 = self._patch(plugin, ["R1", "R2", "R2", "R3"])
+        with p1, p2:
+            text, structured = await plugin._get_distinct_values(
+                {"item_id": "a" * 32, "field": "Zone"}
+            )
+        _validate(AnchorageGISPlugin.DISTINCT_VALUES_OUTPUT_SCHEMA, structured)
+        # de-duplicated, order preserved, raw values
+        assert structured["values"] == ["R1", "R2", "R3"]
+        assert structured["summary"]["returned"] == 3
+        assert structured["summary"]["truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_empty_conforms(self, plugin):
+        p1, p2 = self._patch(plugin, [])
+        with p1, p2:
+            _, structured = await plugin._get_distinct_values(
+                {"item_id": "a" * 32, "field": "Zone"}
+            )
+        _validate(AnchorageGISPlugin.DISTINCT_VALUES_OUTPUT_SCHEMA, structured)
+        assert structured["values"] == []
+
+    @pytest.mark.asyncio
+    async def test_numeric_values_conform(self, plugin):
+        """Values keep their native type -- not everything is a string."""
+        p1, p2 = self._patch(plugin, [1, 2, 3])
+        with p1, p2:
+            _, structured = await plugin._get_distinct_values(
+                {"item_id": "a" * 32, "field": "Zone"}
+            )
+        _validate(AnchorageGISPlugin.DISTINCT_VALUES_OUTPUT_SCHEMA, structured)
+        assert structured["values"] == [1, 2, 3]
+
+    @pytest.mark.asyncio
+    async def test_cap_reached_is_flagged(self, plugin):
+        p1, p2 = self._patch(plugin, [f"V{i}" for i in range(5)])
+        with p1, p2:
+            _, structured = await plugin._get_distinct_values(
+                {"item_id": "a" * 32, "field": "Zone", "limit": 5}
+            )
+        _validate(AnchorageGISPlugin.DISTINCT_VALUES_OUTPUT_SCHEMA, structured)
+        assert structured["summary"]["truncated"] is True
+        assert "values_cap_reached" in {
+            c["code"] for c in structured["caveats"]
+        }
+
+
+# ── footprint_for_parcel ──────────────────────────────────────────────
+
+
+FP_SCHEMA = AnchorageGISPlugin.FOOTPRINT_OUTPUT_SCHEMA
+
+_FP_ATTRS = {
+    "Parcel_ID": "00326477000",
+    "Parcel_Address": "123 MAIN ST",
+    "Zoning_District": "R-1",
+    "Land_Use": "Single Family",
+    "Total_Living_Units": 1,
+    "Lot_Size": 8000.0,
+    "Condo_Unit_Number": None,
+    "Parcel_ID_URL": "https://property.muni.org/x",
+}
+
+
+async def _fp_run(plugin, parcel_features, bldg_features):
+    with patch.object(
+        plugin, "_resolve_layer_url", AsyncMock(return_value="http://x/0")
+    ), patch.object(
+        plugin,
+        "_request_json_with_retry",
+        AsyncMock(return_value={"features": parcel_features}),
+    ), patch.object(
+        plugin, "_paged_geojson_fetch", AsyncMock(return_value=bldg_features)
+    ):
+        return await plugin._footprint_for_parcel(
+            {"parcel_id": "00326477000"}
+        )
+
+
+def _fp_parcel(**over):
+    attrs = dict(_FP_ATTRS)
+    attrs.update(over)
+    return {
+        "attributes": attrs,
+        "geometry": {"rings": [[[0, 0], [0, 20], [20, 20], [20, 0], [0, 0]]]},
+    }
+
+
+class TestFootprintStructuredOutput:
+    @pytest.mark.asyncio
+    async def test_result_conforms(self, plugin):
+        bldg = [
+            {
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [[1, 1], [1, 5], [5, 5], [5, 1], [1, 1]]
+                    ],
+                },
+                "properties": {"OBJECTID": 1, "Category": "General"},
+            }
+        ]
+        _, structured = await _fp_run(plugin, [_fp_parcel()], bldg)
+        _validate(FP_SCHEMA, structured)
+        assert structured["result"] is not None
+        assert structured["result"]["parcel_id"] == "00326477000"
+        assert structured["caveats"], "methodology caveats always apply"
+
+    @pytest.mark.asyncio
+    async def test_not_found_conforms_with_null_result(self, plugin):
+        """The no-parcel path must still emit a valid object."""
+        _, structured = await _fp_run(plugin, [], [])
+        _validate(FP_SCHEMA, structured)
+        assert structured["result"] is None
+        assert "parcel_not_found" in {
+            c["code"] for c in structured["caveats"]
+        }
+
+    @pytest.mark.asyncio
+    async def test_no_independent_lot_conforms(self, plugin):
+        """A condo unit with no lot area yields result: null, not a crash."""
+        _, structured = await _fp_run(
+            plugin, [_fp_parcel(Lot_Size=0.0, Condo_Unit_Number="4B")], []
+        )
+        _validate(FP_SCHEMA, structured)
+        assert structured["result"] is None
+        assert "no_independent_lot" in {
+            c["code"] for c in structured["caveats"]
+        }
+
+    @pytest.mark.asyncio
+    async def test_caveat_messages_match_the_rendering(self, plugin):
+        text, structured = await _fp_run(plugin, [_fp_parcel()], [])
+        for caveat in structured["caveats"]:
+            assert caveat["message"] in text
+
+
+# ── find_features_spanning_classifications ────────────────────────────
+
+
+SPAN_SCHEMA = AnchorageGISPlugin.SPANNING_OUTPUT_SCHEMA
+
+
+def _span_args():
+    return {
+        "source_item_id": "a" * 32,
+        "classification_item_id": "b" * 32,
+        "classification_field": "ZONE",
+    }
+
+
+class TestSpanningStructuredOutput:
+    @pytest.mark.asyncio
+    async def test_no_source_features_conforms(self, plugin):
+        """The zero-source early return must still emit a valid object."""
+        # Source is parcel-grain; the classification layer must NOT be,
+        # or the tool refuses up front (a parcel-vs-parcel spatial join
+        # is the misuse it exists to prevent).
+        source_meta = {
+            "geometryType": "esriGeometryPolygon",
+            "fields": [
+                {"name": "Parcel_ID", "type": "esriFieldTypeString"},
+            ],
+        }
+        cls_meta = {
+            "geometryType": "esriGeometryPolygon",
+            "fields": [{"name": "ZONE", "type": "esriFieldTypeString"}],
+        }
+        with patch.object(
+            plugin, "_resolve_layer_url", AsyncMock(return_value="http://x/0")
+        ), patch.object(
+            plugin,
+            "_fetch_layer_meta",
+            AsyncMock(side_effect=[cls_meta, source_meta, source_meta]),
+        ), patch.object(
+            plugin, "_get_record_count", AsyncMock(return_value=0)
+        ):
+            text, structured = await (
+                plugin._find_features_spanning_classifications(_span_args())
+            )
+
+        _validate(SPAN_SCHEMA, structured)
+        assert structured["rows"] == []
+        assert structured["summary"]["source_features"] == 0
+        assert "no_source_features" in {
+            c["code"] for c in structured["caveats"]
+        }
+
+    def test_rows_withhold_objectids_when_attributes_fail(self):
+        """Schema documents that rows stay empty rather than leaking
+        internal OBJECTIDs a caller could report as parcel numbers."""
+        desc = SPAN_SCHEMA["properties"]["rows"]["description"]
+        assert "withheld" in desc.lower()
+
+    def test_qualifying_may_exceed_returned(self):
+        """`qualifying` is the true count; `returned` is limit-capped."""
+        props = SPAN_SCHEMA["properties"]["summary"]["properties"]
+        assert "exceed" in props["qualifying"]["description"]
