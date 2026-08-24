@@ -88,7 +88,13 @@ plugins:
     org_id: "Ce3DhLRthdwbHlfF"
     city_name: "Municipality of Anchorage"
     gallery_url: "https://muniorg.maps.arcgis.com/apps/instant/filtergallery/index.html?appid=4dac7569f1cc4beb9f22ce168c899a30"
-    timeout: 30
+    # Per-upstream-request HTTP timeout. MUST stay below lambda_timeout
+    # (28s) or a hung ArcGIS call outlives the Lambda: the function is
+    # killed mid-flight and the caller gets an opaque 502 instead of a
+    # readable "upstream timed out" tool error. 20s leaves ~8s to finish
+    # and return. Observed worst-case real tool duration is ~6s, so this
+    # is far above anything legitimate.
+    timeout: 20
 
   ckan:
     enabled: false
