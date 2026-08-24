@@ -776,3 +776,44 @@ class TestSpanningStructuredOutput:
         """`qualifying` is the true count; `returned` is limit-capped."""
         props = SPAN_SCHEMA["properties"]["summary"]["properties"]
         assert "exceed" in props["qualifying"]["description"]
+
+
+# ── zero-result conformance ───────────────────────────────────────────
+
+
+class TestEmptyResultsStillConform:
+    """A declared outputSchema is binding on EVERY path, including the
+    ones that short-circuit before the normal formatter.
+
+    Found in production: spatial_query_point and spatial_query_polygon
+    declared a schema but returned no structuredContent at all when
+    nothing matched, because their no-records branch skips
+    _format_query_results entirely.
+    """
+
+    def test_empty_query_result_conforms(self, plugin):
+        payload = AnchorageGISPlugin._empty_query_result(
+            item_id="a" * 32, where=None, out_fields=None, limit=50
+        )
+        _validate(QR_SCHEMA, payload)
+        assert payload["rows"] == []
+        assert payload["summary"]["returned"] == 0
+
+    def test_empty_result_reports_zero_not_null_total(self, plugin):
+        """Zero matches is a known count. null is reserved for the
+        'this tool does not paginate' case, and conflating them would
+        make a complete answer look like an unmeasured one."""
+        payload = AnchorageGISPlugin._empty_query_result(
+            item_id="a" * 32, where="1=0", out_fields=None, limit=10
+        )
+        assert payload["summary"]["total_count"] == 0
+        assert payload["summary"]["truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_no_schema_declaring_tool_returns_bare_text(self, plugin):
+        """Guards the whole class: every tool that advertises an
+        outputSchema must populate structured_content on the paths this
+        suite can reach."""
+        declared = set(AnchorageGISPlugin.TOOL_OUTPUT_SCHEMAS)
+        # Sanity: the two that regressed in production are covered.
+        assert {"spatial_query_point", "spatial_query_polygon"} <= declared
