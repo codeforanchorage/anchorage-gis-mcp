@@ -6,6 +6,11 @@
 # Testing
 pytest>=7.0.0
 pytest-asyncio>=0.21.0
+# Validates tool output against the outputSchema each tool declares.
+# The MCP spec makes a declared outputSchema binding -- servers MUST
+# return conforming results -- so this is a correctness gate, not a
+# nicety. Dev-only: nothing at runtime validates its own output.
+jsonschema>=4.0.0
 
 # Pre-commit hooks (run: pre-commit install)
 pre-commit>=4.0.0
