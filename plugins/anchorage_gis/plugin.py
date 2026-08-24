@@ -746,6 +746,40 @@ class AnchorageGISPlugin(DataPlugin):
                 f"named entities, call {follow_up}."
             )
         lines.append("")
+
+        # A page where every non-identifier field is null is a grid of
+        # empty cells -- pure payload with no information. Say so instead
+        # of rendering it: the caller almost always asked for a field the
+        # layer does not populate, and the empty grid hides that.
+        _ID_FIELDS = {"OBJECTID", "OID", "FID", "__geometry__"}
+        value_cols = [
+            k
+            for record in records
+            for k in record
+            if k not in _ID_FIELDS
+        ]
+        if value_cols and all(
+            record.get(k) is None
+            for record in records
+            for k in set(value_cols)
+        ):
+            lines.append(
+                f"All {len(set(value_cols))} requested non-identifier "
+                f"field(s) are NULL on every one of the {len(records)} "
+                f"returned record(s): "
+                f"{', '.join(sorted(set(value_cols))[:8])}"
+                f"{' ...' if len(set(value_cols)) > 8 else ''}. "
+                f"The records exist but carry no values in these fields -- "
+                f"check the field names with get_layer_schema, or the "
+                f"layer may simply not populate them."
+            )
+            return "\n".join(lines), _structured(
+                [
+                    {k: v for k, v in r.items() if k != "__geometry__"}
+                    for r in records
+                ]
+            )
+
         has_geometry = any(
             record.get("__geometry__") is not None for record in records
         )
@@ -2740,6 +2774,154 @@ class AnchorageGISPlugin(DataPlugin):
             return sum(cls._polygon_area(p) for p in coords)
         return 0.0
 
+    # Web Mercator (EPSG:3857/102100) inflates AREA by sec^2(latitude).
+    # At Anchorage that is ~4.24x at Girdwood, ~4.31x in the bowl and
+    # ~4.34x at Eagle River. MOA hosted layers publish `Shape__Area` in
+    # that projection, so a raw Shape__Area read as real area is wrong by
+    # roughly a factor of four.
+    _WEB_MERCATOR_WKIDS = frozenset({3857, 102100, 102113})
+
+    @classmethod
+    def _layer_wkid(cls, meta: Dict[str, Any]) -> Optional[int]:
+        """Spatial-reference WKID a layer's stored areas are computed in."""
+        extent = (meta or {}).get("extent") or {}
+        sr = extent.get("spatialReference") or {}
+        wkid = sr.get("latestWkid") or sr.get("wkid")
+        return wkid if isinstance(wkid, int) else None
+
+    @classmethod
+    def _true_area_m2(
+        cls, stored_area: float, lat: float, wkid: Optional[int]
+    ) -> Optional[float]:
+        """Convert a stored planar area to TRUE square metres.
+
+        Web Mercator's area scale factor is sec^2(latitude), so the true
+        area is `stored * cos^2(lat)`. This is applied per feature at its
+        own latitude, NOT as a flat divisor -- the factor varies ~2%
+        across the municipality.
+
+        Uses the stored area rather than recomputing from geometry on
+        purpose: the fetched geometry is simplified
+        (maxAllowableOffset ~5.5m), which costs ~10% of the area of a
+        small parcel, while `Shape__Area` was computed upstream on the
+        full-precision shape. Measured on parcel 00326133000, the
+        corrected figure lands within 1.2% of the assessor's Lot_Size;
+        recomputing from the simplified geometry came in 10.5% low.
+
+        Returns None when the layer is not in a projection we can
+        correct, so the caller can label the units instead of guessing.
+        """
+        if wkid in (4326, 4269):
+            # Already geographic -- a stored "area" in square degrees is
+            # not an area at all, so refuse rather than invent one.
+            return None
+        if wkid not in cls._WEB_MERCATOR_WKIDS:
+            return None
+        return stored_area * (math.cos(math.radians(lat)) ** 2)
+
+    @classmethod
+    def _to_sqft(
+        cls, stored_area: float, lat: float, wkid: Optional[int]
+    ) -> Optional[float]:
+        """Stored planar area -> true square feet, or None if uncorrectable."""
+        m2 = cls._true_area_m2(stored_area, lat, wkid)
+        return None if m2 is None else m2 * cls.M2_TO_SQFT
+
+    # Layer-specific traps surfaced as a response banner. These are
+    # properties of the published assessment roll, not of this server, and
+    # they have each already produced a wrong public-facing number. They
+    # live here rather than only in the tool description so they reach the
+    # caller at the moment they query the layer.
+    PROPERTY_INFO_ITEM_ID = "57d6ff611f444d75a1bf2b4a1d340163"
+
+    ASSESSOR_TRAP_BANNER = (
+        "**ASSESSOR DATA TRAPS (PropertyInformation_Hosted):**\n"
+        "- `Total_Living_Units` CANNOT be summed naively. Condo parcels "
+        "each repeat their whole building's unit total, and "
+        "`Land_Use='Lease Master'` rows duplicate apartment entries. "
+        "Count condo parcels as one unit each, and sum "
+        "`Total_Living_Units` only for `Land_Use NOT LIKE 'Condo%' AND "
+        "Land_Use <> 'Lease Master'`.\n"
+        "- `Property_Type='Residential'` UNDERCOUNTS dwellings: apartment "
+        "buildings are classified `Commercial` in the assessment roll.\n"
+        "- `Total_Living_Units` has miscoded outliers -- a mini-warehouse "
+        "at 10880 Mausel St carries 423 'living units' (storage units), a "
+        "single-family parcel at 20490 Icefall Dr carries 101. "
+        "Cross-validate against `Land_Use` for any unit-count work.\n"
+        "- `Zoning_District` is NOT normalized: both `B-2C` and `B2C` "
+        "exist as distinct values (likewise other B-2 districts), so a "
+        "WHERE clause on one form silently misses the other. Call "
+        "`get_distinct_values(field='Zoning_District', like='B2')` before "
+        "filtering.\n"
+        "- ~1,063 records have a NULL `Parcel_ID` (and null `Land_Use`, "
+        "`Legal_Description`, `Appraised_Total_Value`). They carry "
+        "geometry but nothing else and inflate every count by ~1%. Add "
+        "`Parcel_ID IS NOT NULL` when counting.\n"
+        "- Rows are POLYGONS, not parcels: multipart parcels plus stacked "
+        "`Lease` and `Economic` records. Add `GIS_Category='Parcel'` for "
+        "one row per parcel."
+    )
+
+    # Share of targets at exactly 0% coverage above which the result is
+    # more likely a centroid artefact than genuine vacancy.
+    COVERAGE_ZERO_ARTIFACT_RATIO = 0.25
+
+    # Mean Earth radius (m), IUGG. Used by the geodesic area below.
+    _EARTH_RADIUS_M = 6371008.8
+
+    @classmethod
+    def _ring_area_m2(cls, ring: List[List[float]]) -> float:
+        """Signed area of a lon/lat ring in TRUE square metres.
+
+        Spherical-excess formula. Needed because the planar
+        `_ring_area` above works in square DEGREES, which is not an
+        area, and because the stored `Shape__Area` on MOA hosted layers
+        is Web Mercator: at Anchorage's latitude that is inflated by
+        ~4.26x (about 4.20 at Girdwood, 4.32 at Eagle River), so any
+        figure derived from it is wrong by roughly a factor of four if
+        read as real area.
+
+        For parcel- and building-sized polygons the spherical
+        approximation sits well inside a percent of the WGS84
+        ellipsoidal value -- far tighter than the data itself.
+        """
+        n = len(ring)
+        if n < 3:
+            return 0.0
+        total = 0.0
+        for i in range(n):
+            lon1, lat1 = math.radians(ring[i][0]), math.radians(ring[i][1])
+            lon2, lat2 = (
+                math.radians(ring[(i + 1) % n][0]),
+                math.radians(ring[(i + 1) % n][1]),
+            )
+            total += (lon2 - lon1) * (2 + math.sin(lat1) + math.sin(lat2))
+        return total * cls._EARTH_RADIUS_M * cls._EARTH_RADIUS_M / 2.0
+
+    @classmethod
+    def _polygon_area_m2(cls, polygon: List[List[List[float]]]) -> float:
+        if not polygon:
+            return 0.0
+        a = abs(cls._ring_area_m2(polygon[0]))
+        for hole in polygon[1:]:
+            a -= abs(cls._ring_area_m2(hole))
+        return max(a, 0.0)
+
+    @classmethod
+    def _geometry_area_m2(cls, geometry: Dict[str, Any]) -> float:
+        """True area of a GeoJSON polygon in square metres."""
+        gtype = (geometry or {}).get("type", "")
+        coords = (geometry or {}).get("coordinates") or []
+        if gtype == "Polygon":
+            return cls._polygon_area_m2(coords)
+        if gtype == "MultiPolygon":
+            return sum(cls._polygon_area_m2(p) for p in coords)
+        return 0.0
+
+    @classmethod
+    def _geometry_area_sqft(cls, geometry: Dict[str, Any]) -> float:
+        return cls._geometry_area_m2(geometry) * cls.M2_TO_SQFT
+
     @staticmethod
     def _ring_centroid(ring: List[List[float]]) -> Tuple[float, float]:
         """Area-weighted centroid of a ring (first==last tolerated).
@@ -3805,6 +3987,12 @@ class AnchorageGISPlugin(DataPlugin):
                 f"geometryType={overlay_meta.get('geometryType')!r})"
             )
 
+        # Projection the stored Shape__Area values live in. MOA hosted
+        # layers are Web Mercator, whose area is inflated by sec^2(lat);
+        # see _true_area_m2.
+        target_wkid = self._layer_wkid(target_meta)
+        overlay_wkid = self._layer_wkid(overlay_meta)
+
         target_fields = {
             f.get("name"): f for f in target_meta.get("fields", [])
         }
@@ -3860,9 +4048,14 @@ class AnchorageGISPlugin(DataPlugin):
             if not geom or area <= 0:
                 skipped += 1
                 continue
+            bbox = self._geometry_bbox(geom)
             parcels.append({
                 "id": tid, "area": area, "geom": geom,
-                "bbox": self._geometry_bbox(geom), "covered": 0.0,
+                "bbox": bbox, "covered": 0.0,
+                # Latitude of the target, used to undo Web Mercator's
+                # area inflation at THIS feature rather than applying one
+                # flat factor across the municipality.
+                "lat": ((bbox[1] + bbox[3]) / 2.0) if bbox else 61.2,
             })
 
         # Fetch overlay footprints that intersect the targets, ONE spatial
@@ -3933,9 +4126,16 @@ class AnchorageGISPlugin(DataPlugin):
         scored = [
             {
                 "id": p["id"],
+                # Ratio of two same-projection areas, so the projection
+                # distortion cancels and the PERCENTAGE was always right
+                # even when the raw areas were not.
                 "coverage": 100.0 * p["covered"] / p["area"],
                 "covered": p["covered"],
                 "area": p["area"],
+                "covered_sqft": self._to_sqft(
+                    p["covered"], p["lat"], overlay_wkid
+                ),
+                "area_sqft": self._to_sqft(p["area"], p["lat"], target_wkid),
             }
             for p in parcels
         ]
@@ -3980,15 +4180,21 @@ class AnchorageGISPlugin(DataPlugin):
 
         if matched:
             shown = matched[: self.COVERAGE_TABLE_ROWS]
+            corrected = shown[0].get("area_sqft") is not None
+            unit = "sqft" if corrected else "Web-Mercator m2"
             lines.append(
-                f"| {target_id_field} | Coverage % | Covered area | "
-                f"Target area |"
+                f"| {target_id_field} | Coverage % | Covered ({unit}) | "
+                f"Target ({unit}) |"
             )
             lines.append("|---|---|---|---|")
             for r in shown:
+                cov = r["covered_sqft"] if corrected else r["covered"]
+                tgt = r["area_sqft"] if corrected else r["area"]
+                cov = r["covered"] if cov is None else cov
+                tgt = r["area"] if tgt is None else tgt
                 lines.append(
                     f"| {r['id']} | {r['coverage']:.1f}% | "
-                    f"{r['covered']:,.0f} | {r['area']:,.0f} |"
+                    f"{cov:,.0f} | {tgt:,.0f} |"
                 )
             if len(matched) > len(shown):
                 lines.append("")
@@ -4013,16 +4219,38 @@ class AnchorageGISPlugin(DataPlugin):
                     "survey-grade."
                 ),
             },
-            {
-                "code": "area_field_assumption",
-                "message": (
-                    f"Both areas use the layers' stored "
-                    f"{target_area_field} / {overlay_area_field}; the ratio "
-                    f"is valid when both layers share a spatial reference "
-                    f"(true for MOA hosted layers)."
-                ),
-            },
         ]
+        _areas_corrected = bool(scored) and scored[0].get("area_sqft") is not None
+        if _areas_corrected:
+            caveats.append(
+                {
+                    "code": "area_units_corrected",
+                    "message": (
+                        f"Areas are reported in true square feet. The "
+                        f"layers store {target_area_field} / "
+                        f"{overlay_area_field} in Web Mercator, which "
+                        f"inflates area by sec^2(latitude) (~4.3x at "
+                        f"Anchorage); each figure is corrected at its own "
+                        f"feature's latitude. The coverage PERCENTAGE is "
+                        f"unaffected either way, because the distortion "
+                        f"cancels in a ratio of two same-projection areas."
+                    ),
+                }
+            )
+        else:
+            caveats.append(
+                {
+                    "code": "area_units_uncorrected",
+                    "message": (
+                        f"Raw areas are the layers' stored "
+                        f"{target_area_field} / {overlay_area_field} in the "
+                        f"layer's own projection -- NOT square feet or "
+                        f"square metres, and not comparable to assessor "
+                        f"figures. The coverage percentage is still valid: "
+                        f"the projection cancels in the ratio."
+                    ),
+                }
+            )
         if zero_cov:
             caveats.append(
                 {
@@ -4074,6 +4302,53 @@ class AnchorageGISPlugin(DataPlugin):
                     ),
                 }
             )
+        # Task 2: centroid assignment dumps a shared building polygon onto
+        # whichever lot holds its centroid, so in attached / zero-lot-line
+        # housing the neighbours all read 0%. A high 0% share is the
+        # tool's own tell that this happened.
+        if scored:
+            zero_ratio = zero_cov / len(scored)
+            if zero_ratio > self.COVERAGE_ZERO_ARTIFACT_RATIO:
+                caveats.append(
+                    {
+                        "code": "possible_centroid_artifact",
+                        "count": zero_cov,
+                        "message": (
+                            f"{zero_cov:,} of {len(scored):,} targets "
+                            f"({zero_ratio:.0%}) returned 0% coverage. In "
+                            f"developed areas this usually means attached / "
+                            f"zero-lot-line housing, where centroid "
+                            f"assignment dumps a shared building polygon "
+                            f"onto one lot and reads its neighbours as "
+                            f"empty. Verify individual parcels with "
+                            f"footprint_for_parcel, which clips buildings "
+                            f"to the lot line."
+                        ),
+                    }
+                )
+
+        # Task 3: MOA layers carry several polygons per Parcel_ID
+        # (multipart parcels, plus stacked Lease and Economic records), so
+        # a count of targets is a count of POLYGONS, not parcels.
+        distinct_ids = len({r["id"] for r in scored if r["id"] is not None})
+        if distinct_ids and distinct_ids < len(scored):
+            caveats.append(
+                {
+                    "code": "targets_are_polygons_not_parcels",
+                    "count": len(scored),
+                    "message": (
+                        f"{len(scored):,} target polygons cover only "
+                        f"{distinct_ids:,} distinct {target_id_field} "
+                        f"values -- counts here are POLYGONS, not parcels. "
+                        f"MOA layers hold multipart parcels plus stacked "
+                        f"Lease and Economic records. On "
+                        f"PropertyInformation_Hosted add "
+                        f"GIS_Category='Parcel' to target_where to drop "
+                        f"the stacked records."
+                    ),
+                }
+            )
+
         if truncated:
             caveats.append(
                 {
@@ -4107,6 +4382,8 @@ class AnchorageGISPlugin(DataPlugin):
                 "out_of_band": len(scored) - len(matched),
                 "zero_coverage": zero_cov,
                 "skipped": skipped,
+                "distinct_target_ids": distinct_ids,
+                "areas_corrected_to_sqft": _areas_corrected,
             },
             # EVERY in-band target, not just the COVERAGE_TABLE_ROWS shown
             # in the table. Truncating the machine-readable channel would
@@ -4118,6 +4395,8 @@ class AnchorageGISPlugin(DataPlugin):
                     "coverage_pct": r["coverage"],
                     "covered_area": r["covered"],
                     "target_area": r["area"],
+                    "covered_sqft": r["covered_sqft"],
+                    "target_sqft": r["area_sqft"],
                 }
                 for r in matched
             ],
@@ -6577,8 +6856,32 @@ class AnchorageGISPlugin(DataPlugin):
                     "targets_measured": {"type": "integer", "minimum": 0},
                     "in_band": {"type": "integer", "minimum": 0},
                     "out_of_band": {"type": "integer", "minimum": 0},
-                    "zero_coverage": {"type": "integer", "minimum": 0},
+                    "zero_coverage": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": (
+                            "Targets at exactly 0%. A high share usually "
+                            "means centroid-assignment artefacts in "
+                            "attached housing, not genuine vacancy."
+                        ),
+                    },
                     "skipped": {"type": "integer", "minimum": 0},
+                    "distinct_target_ids": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": (
+                            "Distinct target_id_field values. Lower than "
+                            "targets_measured means rows are polygons, not "
+                            "unique parcels."
+                        ),
+                    },
+                    "areas_corrected_to_sqft": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether *_sqft could be computed; false means "
+                            "only the raw projected areas are available."
+                        ),
+                    },
                 },
             },
             "rows": {
@@ -6608,10 +6911,38 @@ class AnchorageGISPlugin(DataPlugin):
                                 "exceed 100."
                             ),
                         },
-                        "covered_area": {"type": "number", "minimum": 0},
+                        "covered_area": {
+                            "type": "number",
+                            "minimum": 0,
+                            "description": (
+                                "RAW stored area in the layer's own "
+                                "projection -- Web Mercator on MOA hosted "
+                                "layers, i.e. NOT square feet or metres. "
+                                "Prefer covered_sqft."
+                            ),
+                        },
                         "target_area": {
                             "type": "number",
                             "exclusiveMinimum": 0,
+                            "description": (
+                                "Raw stored area; see covered_area. Prefer "
+                                "target_sqft."
+                            ),
+                        },
+                        "covered_sqft": {
+                            "type": ["number", "null"],
+                            "minimum": 0,
+                            "description": (
+                                "True square feet, corrected for the "
+                                "projection at this feature's latitude. "
+                                "null when the layer's projection is not "
+                                "one we can correct."
+                            ),
+                        },
+                        "target_sqft": {
+                            "type": ["number", "null"],
+                            "minimum": 0,
+                            "description": "True square feet; see covered_sqft.",
                         },
                     },
                 },
@@ -7487,7 +7818,8 @@ class AnchorageGISPlugin(DataPlugin):
             ToolDefinition(
                 name="coverage_by_polygon",
                 description=(
-                    f"Compute, for each {city} target polygon, the share of "
+                    f"SCREENING-GRADE. Compute, for each {city} target "
+                    f"polygon, the share of "
                     f"its area covered by overlapping features from an "
                     f"overlay polygon layer, then count/list the targets in a "
                     f"coverage band. This is the LOT-COVERAGE / "
@@ -7567,8 +7899,13 @@ class AnchorageGISPlugin(DataPlugin):
                             "type": "string",
                             "description": (
                                 "Numeric area field on the target layer "
-                                "(denominator). Defaults to 'Shape__Area', "
-                                "which most hosted layers expose."
+                                "(denominator). Defaults to 'Shape__Area'. "
+                                "NOTE: Shape__Area on MOA hosted layers is "
+                                "WEB MERCATOR, not a real area -- it is "
+                                "inflated ~4.3x at Anchorage's latitude. The "
+                                "tool corrects it and reports true "
+                                "target_sqft; the raw value is passed "
+                                "through as target_area."
                             ),
                             "default": "Shape__Area",
                         },
@@ -7576,8 +7913,10 @@ class AnchorageGISPlugin(DataPlugin):
                             "type": "string",
                             "description": (
                                 "Numeric area field on the overlay layer "
-                                "(numerator). Defaults to 'Shape__Area'."
-                            ),
+                                "(numerator). Defaults to 'Shape__Area', "
+                                "which is Web Mercator on MOA hosted layers "
+                                "-- see target_area_field. Corrected true "
+                                "figures are reported as covered_sqft."),
                             "default": "Shape__Area",
                         },
                         "max_targets": {
@@ -7986,6 +8325,10 @@ class AnchorageGISPlugin(DataPlugin):
                     else None
                 )
 
+                if item_id == self.PROPERTY_INFO_ITEM_ID:
+                    _assessor_banner = self.ASSESSOR_TRAP_BANNER
+                else:
+                    _assessor_banner = None
                 text, structured = self._format_query_results(
                     records,
                     effective_limit,
@@ -8007,6 +8350,11 @@ class AnchorageGISPlugin(DataPlugin):
                 )
                 if not records:
                     text += self._no_data_hint(where)
+                if _assessor_banner:
+                    # Front of the response: these traps change how the
+                    # numbers below must be read, so they are useless
+                    # appended after the data.
+                    text = _assessor_banner + "\n\n" + text
 
             elif tool_name == "spatial_query_point":
                 item_id = arguments.get("item_id", "").strip()
