@@ -38,21 +38,33 @@ in-place):
 
 ## Traffic postures
 
-| Var | Steady state | ESRI UC week (set 2026-07-13) |
+| Var | Steady state | Raised (e.g. ESRI UC week) |
 |---|---|---|
 | `api_rate_limit` | 5 | 20 |
 | `api_burst_limit` | 10 | 40 |
 | `lambda_reserved_concurrency` | 10 | 25 |
 | `waf_rate_limit_per_5min` | 300 | 600 |
 
-**⏰ REVERT AFTER THE CONFERENCE:** set the steady-state values in
-`terraform/aws/prod.tfvars` and apply:
+**Current posture: STEADY STATE**, restored 2026-08-23. The ESRI UC
+raise ran 2026-07-13 .. 2026-08-23.
+
+To change posture, edit `terraform/aws/prod.tfvars` and deploy,
+answering `yes` at the script's own confirm gate:
 
 ```bash
-cd terraform/aws
-terraform apply -var-file=prod.tfvars -var="aws_region=us-west-2" \
-  -var="config_file=config.yaml"
+./scripts/deploy.sh -e prod
 ```
+
+> **⚠ `waf_rate_limit_per_5min` no longer takes effect from this repo.**
+> Since `use_shared_waf = true`, the per-IP limit is a Host-scoped rule
+> in the fleet web ACL owned by **mcp-stats**. Change it there, in
+> `fleet_waf_members` under key `anchorage-gis`, and apply in that repo.
+> The value in `prod.tfvars` applies only on a rollback to a dedicated
+> ACL.
+>
+> **Known gap as of 2026-08-23:** the fleet value is still **600** while
+> this repo reads 300, so the live per-IP limit remains at the raised
+> setting until mcp-stats is updated.
 
 Worst-case cost at full 24/7 saturation: steady ≈ $17/day, UC posture
 ≈ $50/day. Realistic traffic is far below both (conversational MCP is
