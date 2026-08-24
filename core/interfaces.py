@@ -20,6 +20,27 @@ class PluginType(str, Enum):
     ANALYTICS = "analytics"
 
 
+class UnknownToolError(ValueError):
+    """Raised when tools/call names a tool this server does not expose.
+
+    Subclasses ValueError deliberately: it is an argument problem, and
+    existing `except ValueError` handlers around execute_tool keep
+    working unchanged.
+
+    Mapped to JSON-RPC -32602 with the message shape the MCP tools spec
+    uses ("Unknown tool: <name>") rather than the generic -32603
+    "Internal error": naming a missing tool is a caller mistake, not a
+    server fault. Clients are told they MAY surface protocol errors to
+    the model, so the available-tool list travels in `data` to let a
+    model self-correct.
+    """
+
+    def __init__(self, tool_name: str, available: str = "") -> None:
+        self.tool_name = tool_name
+        self.available = available
+        super().__init__(f"Unknown tool: {tool_name}")
+
+
 class ToolDefinition(BaseModel):
     """Definition of an MCP tool provided by a plugin."""
 
