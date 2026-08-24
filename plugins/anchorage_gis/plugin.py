@@ -394,6 +394,45 @@ class AnchorageGISPlugin(DataPlugin):
             return ""
         return str(value).replace("|", "\\|")
 
+    @staticmethod
+    def _empty_query_result(
+        *,
+        item_id: Optional[str],
+        where: Optional[str],
+        out_fields: Optional[str],
+        limit: int,
+    ) -> Dict[str, Any]:
+        """A conforming QUERY_RESULT payload for a zero-row answer.
+
+        The spatial_query_* tools short-circuit before
+        _format_query_results when nothing matches, so they cannot get
+        their structured result from it. They still declare an
+        outputSchema, and the MCP spec makes a declared schema binding on
+        every path -- so "no matches" is a valid RESULT, not an excuse to
+        omit structuredContent.
+
+        total_count is 0 rather than null here: zero matches is a known,
+        complete count, not the "this tool does not paginate" case null
+        is reserved for.
+        """
+        return {
+            "query": {
+                "item_id": item_id,
+                "service_url": None,
+                "where": where,
+                "out_fields": out_fields,
+                "limit": limit,
+                "geometry_type": None,
+            },
+            "summary": {
+                "returned": 0,
+                "total_count": 0,
+                "truncated": False,
+            },
+            "rows": [],
+            "caveats": [],
+        }
+
     def _format_query_results(
         self,
         records: List[Dict[str, Any]],
@@ -7969,6 +8008,17 @@ class AnchorageGISPlugin(DataPlugin):
                         f"No features in item `{item_id}` contain point "
                         f"(lon={arguments['lon']}, lat={arguments['lat']})."
                     )
+                    # This branch skips _format_query_results, so the
+                    # structured half has to be built here. The tool
+                    # declares an outputSchema, and the spec makes that
+                    # binding on EVERY path -- returning nothing on the
+                    # empty result would silently break conformance.
+                    structured = self._empty_query_result(
+                        item_id=item_id,
+                        where=arguments.get("where"),
+                        out_fields=arguments.get("out_fields"),
+                        limit=limit,
+                    )
                 else:
                     # total_count=None avoids a misleading "of N total"
                     # line: every match is already in `records`, there
@@ -8048,6 +8098,15 @@ class AnchorageGISPlugin(DataPlugin):
                     text = (
                         f"No features in item `{item_id}` match the "
                         f"filter polygon."
+                    )
+                    # Same as spatial_query_point above: the no-match
+                    # path bypasses the formatter, so build the
+                    # conforming empty result explicitly.
+                    structured = self._empty_query_result(
+                        item_id=item_id,
+                        where=arguments.get("where"),
+                        out_fields=arguments.get("out_fields"),
+                        limit=effective_limit,
                     )
                 else:
                     text, structured = self._format_query_results(
