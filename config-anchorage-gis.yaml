@@ -87,7 +87,8 @@ plugins:
     org_id: "Ce3DhLRthdwbHlfF"
     city_name: "Municipality of Anchorage"
     gallery_url: "https://muniorg.maps.arcgis.com/apps/instant/filtergallery/index.html?appid=4dac7569f1cc4beb9f22ce168c899a30"
-    timeout: 30
+    # Must stay below lambda_timeout; see config.yaml for rationale.
+    timeout: 20
 
   ckan:
     enabled: false
