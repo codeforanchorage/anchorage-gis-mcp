@@ -10,26 +10,30 @@ lambda_timeout  = 120
 api_quota_limit = 3000
 # Rate/burst feed BOTH the stage-wide throttle (the aggregate cap on the
 # keyless public /mcp) and the usage-plan throttle (API-key traffic).
-# ESRI UC WEEK POSTURE (raised 2026-07-13 for conference traffic; see
-# docs/RUNBOOK.md): 20 rps / 40 burst. Steady-state values: 5 / 10.
-api_rate_limit  = 20
-api_burst_limit = 40
+# Steady-state posture, restored 2026-08-23 after the ESRI UC week raise
+# (2026-07-13 .. 2026-08-23 ran at 20 / 40); see docs/RUNBOOK.md.
+api_rate_limit  = 5
+api_burst_limit = 10
 custom_domain   = "anchorage-gis.codeforanchorage.org"
 
 # Cap concurrent Lambda executions. Cost and blast-radius protection if
 # WAF is bypassed via distributed sources. Conversational MCP traffic does
 # not need horizontal scale; raise if legitimate users start getting throttled.
-# ESRI UC WEEK POSTURE: 25 (steady-state: 10). Bounds worst-case Lambda
-# spend to ~25 GB-s/s ~= $36/day even at full saturation.
-lambda_reserved_concurrency = 25
+# Steady-state: 10, restored 2026-08-23 (ESRI UC week ran at 25). Bounds
+# worst-case Lambda spend to ~10 GB-s/s ~= $14/day even at full saturation.
+lambda_reserved_concurrency = 10
 
 # WAF per-IP rate limit (rolling 5-minute window). The MCP tools are
 # conversational, so 1 rps sustained per IP (~300/5min) is plenty for
 # real users and tight enough to slow scrapers and denial-of-wallet probes.
 # NOTE: ALL claude.ai users share ~5 Anthropic egress IPs (160.79.106.32/27),
 # so this per-IP limit is effectively an aggregate cap on claude.ai traffic.
-# ESRI UC WEEK POSTURE: 600 (steady-state: 300).
-waf_rate_limit_per_5min = 600
+# Steady-state: 300, restored 2026-08-23 (ESRI UC week ran at 600).
+# NOTE: INERT while use_shared_waf = true -- it only takes effect on a
+# rollback to a dedicated ACL. The LIVE per-IP limit lives in mcp-stats'
+# `fleet_waf_members` under key `anchorage-gis` and must be lowered to 300
+# THERE as well, or the effective WAF cap stays at 600.
+waf_rate_limit_per_5min = 300
 
 # CloudWatch alarms (errors, throttles, 5xx, probing, duration) notify this
 # topic; email subscription on it. Empty string = alarms are dashboard-only.
