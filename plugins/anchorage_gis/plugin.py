@@ -409,8 +409,20 @@ class AnchorageGISPlugin(DataPlugin):
         coded_domains: Optional[Dict[str, Dict[Any, str]]] = None,
         last_edit_date: Optional[int] = None,
         coverage_pct: Optional[float] = None,
-    ) -> str:
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Render a record set, and return its structured twin.
+
+        Returns (text, structured) where structured conforms to
+        QUERY_RESULT_OUTPUT_SCHEMA. Shared by query_data,
+        spatial_query_point, spatial_query_polygon and
+        filter_by_polygon, so all four get structured output from this
+        one place.
+        """
         provenance: List[str] = []
+        # Structured twin of the caveats appended to `provenance` below.
+        # Both are produced here so a caveat can never appear in one and
+        # not the other.
+        caveats: List[Dict[str, Any]] = []
         if service_url:
             provenance.append(f"Source: {service_url}")
         if where is not None or out_fields is not None:
@@ -437,6 +449,20 @@ class AnchorageGISPlugin(DataPlugin):
             and total_count > len(records)
         )
         if truncated:
+            caveats.append(
+                {
+                    "code": "result_truncated",
+                    "count": total_count,
+                    "limit": limit,
+                    "message": (
+                        f"Returned {len(records)} of {total_count:,} "
+                        f"matching records (limit={limit}). The listed "
+                        f"records are a SAMPLE -- do not generalize "
+                        f"counts or percentages from them. Use "
+                        f"total_count for 'how many?' questions."
+                    ),
+                }
+            )
             provenance.append(
                 f"**TRUNCATED:** returned {len(records)} of "
                 f"{total_count:,} matching records (limit={limit}). "
@@ -450,6 +476,17 @@ class AnchorageGISPlugin(DataPlugin):
         # total_count was actually computed and the result is small
         # enough that a model could mistakenly extrapolate a trend.
         if total_count == 1:
+            caveats.append(
+                {
+                    "code": "single_record",
+                    "count": 1,
+                    "message": (
+                        "Only 1 matching record. Do not report this as "
+                        "a trend, pattern, or distribution -- it is an "
+                        "N=1 anecdote."
+                    ),
+                }
+            )
             provenance.append(
                 "**SINGLE-RECORD CLAIM:** only 1 matching record. Do "
                 "not report this as a trend, pattern, or "
@@ -459,6 +496,19 @@ class AnchorageGISPlugin(DataPlugin):
             total_count is not None
             and 1 < total_count < self.SMALL_SAMPLE_THRESHOLD
         ):
+            caveats.append(
+                {
+                    "code": "small_sample",
+                    "count": total_count,
+                    "limit": self.SMALL_SAMPLE_THRESHOLD,
+                    "message": (
+                        f"Only {total_count} matching records. "
+                        f"Percentages, distributions, and trend claims "
+                        f"drawn from this set are weak -- name the "
+                        f"sample size in any summary."
+                    ),
+                }
+            )
             provenance.append(
                 f"**SMALL SAMPLE:** only {total_count} matching "
                 f"records. Percentages, distributions, and trend "
@@ -478,6 +528,20 @@ class AnchorageGISPlugin(DataPlugin):
                 age_days = (datetime.now(timezone.utc) - edit_dt).days
                 if age_days > self.STALENESS_THRESHOLD_DAYS:
                     age_years = age_days / 365.25
+                    caveats.append(
+                        {
+                            "code": "stale_layer",
+                            "count": age_days,
+                            "limit": self.STALENESS_THRESHOLD_DAYS,
+                            "message": (
+                                f"Layer last edited "
+                                f"{edit_dt.strftime('%Y-%m-%d')} "
+                                f"({age_years:.1f} years ago). Confirm "
+                                f"this matches the recency the "
+                                f"question needs."
+                            ),
+                        }
+                    )
                     provenance.append(
                         f"**DATA FRESHNESS:** layer last edited "
                         f"{edit_dt.strftime('%Y-%m-%d')} "
@@ -492,6 +556,16 @@ class AnchorageGISPlugin(DataPlugin):
         # honest silence beats a guessed flag.
         if coverage_pct is not None:
             if coverage_pct == 0.0:
+                caveats.append(
+                    {
+                        "code": "no_coverage",
+                        "message": (
+                            "This layer's spatial extent does not "
+                            "overlap Anchorage at all. Confirm this is "
+                            "the right layer."
+                        ),
+                    }
+                )
                 provenance.append(
                     "**COVERAGE:** this layer's spatial extent does "
                     "not overlap Anchorage at all. Confirm this is "
@@ -499,6 +573,18 @@ class AnchorageGISPlugin(DataPlugin):
                 )
             elif coverage_pct < self.COVERAGE_THRESHOLD:
                 pct_int = max(1, int(round(coverage_pct * 100)))
+                caveats.append(
+                    {
+                        "code": "limited_coverage",
+                        "count": pct_int,
+                        "message": (
+                            f"This layer's extent covers ~{pct_int}% of "
+                            f"Anchorage. Confirm the question's area of "
+                            f"interest falls inside the layer's "
+                            f"coverage."
+                        ),
+                    }
+                )
                 provenance.append(
                     f"**LIMITED COVERAGE:** this layer's extent "
                     f"covers ~{pct_int}% of Anchorage. Confirm the "
@@ -506,10 +592,42 @@ class AnchorageGISPlugin(DataPlugin):
                     f"layer's coverage."
                 )
 
+        def _structured(rendered_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+            out: Dict[str, Any] = {
+                "query": {
+                    "item_id": item_id,
+                    "service_url": service_url,
+                    "where": where,
+                    "out_fields": out_fields,
+                    "limit": limit,
+                    "geometry_type": geometry_type,
+                },
+                "summary": {
+                    "returned": len(rendered_rows),
+                    "total_count": total_count,
+                    "truncated": bool(truncated),
+                },
+                "rows": rendered_rows,
+                "caveats": caveats,
+            }
+            # Raw values keep their JSON types, so dates arrive as epoch
+            # milliseconds and coded fields as their stored codes. Ship
+            # the domain map alongside so a consumer can decode without
+            # a second round-trip.
+            if coded_domains:
+                out["coded_domains"] = {
+                    field: {str(code): label for code, label in mapping.items()}
+                    for field, mapping in coded_domains.items()
+                }
+            return out
+
         if not records:
             if provenance:
-                return "\n".join(provenance + ["", "No records returned."])
-            return "No records returned."
+                return (
+                    "\n".join(provenance + ["", "No records returned."]),
+                    _structured([]),
+                )
+            return "No records returned.", _structured([])
 
         count_part = f"{len(records)}"
         if total_count is not None:
@@ -553,6 +671,23 @@ class AnchorageGISPlugin(DataPlugin):
                     f"`get_distinct_values` on it to count unique "
                     f"entities"
                 )
+            caveats.append(
+                {
+                    "code": "polyline_grain",
+                    "count": total_count,
+                    "message": (
+                        f"The count is the number of LINE SEGMENTS "
+                        f"(geometry features), NOT unique named "
+                        f"entities. A single named trail, road or route "
+                        f"is typically stored as multiple connected "
+                        f"segments, so {total_count:,} records usually "
+                        f"means fewer than {total_count:,} distinct "
+                        f"named features. Say "
+                        f"'{total_count:,} trail segments' rather than "
+                        f"'{total_count:,} trails'."
+                    ),
+                }
+            )
             lines.append(
                 f"**GRAIN NOTE (polyline layer):** the count above "
                 f"is the number of LINE SEGMENTS (geometry features), "
@@ -634,7 +769,17 @@ class AnchorageGISPlugin(DataPlugin):
         # the full response top-down, so the older bottom-of-response
         # restatement that guarded against GPT-4o-style summarization is
         # no longer needed and has been dropped.
-        return "\n".join(lines)
+        rows: List[Dict[str, Any]] = []
+        for record in records:
+            row = {k: v for k, v in record.items() if k != "__geometry__"}
+            geometry = record.get("__geometry__")
+            if geometry is not None:
+                # Full geometry, not the character-clipped rendering the
+                # text uses -- truncating the machine-readable copy would
+                # make it unusable for anything downstream.
+                row["__geometry__"] = geometry
+            rows.append(row)
+        return "\n".join(lines), _structured(rows)
 
     # ── DataPlugin interface methods ──────────────────────────────────────
 
@@ -3934,7 +4079,13 @@ class AnchorageGISPlugin(DataPlugin):
             "caveats": caveats,
         }
 
-    async def _filter_by_polygon(self, args: Dict[str, Any]) -> str:
+    async def _filter_by_polygon(
+        self, args: Dict[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Return source features falling inside container polygons.
+
+        Returns (text, structured); the structured half conforms to
+        QUERY_RESULT_OUTPUT_SCHEMA like the other record tools."""
         source_item_id = self._validate_item_id(
             (args.get("source_item_id") or "").strip()
         )
@@ -4000,7 +4151,26 @@ class AnchorageGISPlugin(DataPlugin):
                 f"Did you misspell a name? Try "
                 f"`search_spatial_layers` or `query_data` to browse "
                 f"valid values for the container field."
-            )
+            ), {
+                "query": {
+                    "item_id": source_item_id,
+                    "service_url": None,
+                    "where": source_where,
+                    "out_fields": out_fields,
+                    "limit": effective_limit,
+                    "geometry_type": None,
+                    "container_item_id": container_item_id,
+                    "container_where": container_where,
+                    "container_polygons_matched": 0,
+                },
+                "summary": {
+                    "returned": 0,
+                    "total_count": 0,
+                    "truncated": False,
+                },
+                "rows": [],
+                "caveats": [],
+            }
 
         # Delegate the actual spatial query to spatial_query_polygon's
         # filter-item pathway so we get server-side intersection and
@@ -4031,15 +4201,52 @@ class AnchorageGISPlugin(DataPlugin):
                 header
                 + f"No features in `{source_item_id}` fall inside the "
                 f"selected polygon(s)."
-            )
-        body = self._format_query_results(
+            ), {
+                "query": {
+                    "item_id": source_item_id,
+                    "service_url": None,
+                    "where": source_where,
+                    "out_fields": out_fields,
+                    "limit": effective_limit,
+                    "geometry_type": None,
+                    "container_item_id": container_item_id,
+                    "container_where": container_where,
+                    "container_polygons_matched": matched_polygons,
+                },
+                "summary": {
+                    "returned": 0,
+                    "total_count": 0,
+                    "truncated": False,
+                },
+                "rows": [],
+                "caveats": [],
+            }
+        body, structured = self._format_query_results(
             records, effective_limit, total_count=None, date_fields=None
         )
-        return header + body
+        # The shared formatter does not know about the container layer;
+        # add that context so the structured result explains what was
+        # actually filtered.
+        structured["query"].update(
+            {
+                "item_id": source_item_id,
+                "where": source_where,
+                "out_fields": out_fields,
+                "container_item_id": container_item_id,
+                "container_where": container_where,
+                "container_polygons_matched": matched_polygons,
+            }
+        )
+        return header + body, structured
 
-    async def _get_distinct_values(self, args: Dict[str, Any]) -> str:
+    async def _get_distinct_values(
+        self, args: Dict[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
         """Return distinct values of a field -- for confirming exact
-        identifier/code formats before constructing a WHERE clause."""
+        identifier/code formats before constructing a WHERE clause.
+
+        Returns (text, structured); the structured half conforms to
+        DISTINCT_VALUES_OUTPUT_SCHEMA."""
         item_id = self._validate_item_id(
             (args.get("item_id") or "").strip()
         )
@@ -4114,6 +4321,42 @@ class AnchorageGISPlugin(DataPlugin):
             seen.add(v)
             values.append(v)
 
+        def _structured(
+            vals: List[Any], capped: bool
+        ) -> Dict[str, Any]:
+            caveats: List[Dict[str, Any]] = []
+            if capped:
+                caveats.append(
+                    {
+                        "code": "values_cap_reached",
+                        "limit": limit,
+                        "count": len(vals),
+                        "message": (
+                            f"Hit the {limit}-value cap, so this list may "
+                            f"be incomplete. Raise limit or narrow with "
+                            f"`like` for the full set."
+                        ),
+                    }
+                )
+            return {
+                "query": {
+                    "item_id": item_id,
+                    "field": field,
+                    "where": where,
+                    "like": like or None,
+                    "limit": limit,
+                },
+                "summary": {
+                    "returned": len(vals),
+                    "truncated": capped,
+                },
+                # Raw stored values, in the layer's own types. These are
+                # what a WHERE clause must match -- matching is
+                # case-sensitive, so they are NOT normalized here.
+                "values": vals,
+                "caveats": caveats,
+            }
+
         if not values:
             suffix = f" containing '{like}'" if like else ""
             return (
@@ -4126,7 +4369,7 @@ class AnchorageGISPlugin(DataPlugin):
                     else "The layer may have no records, or every "
                     "value may be NULL."
                 )
-            )
+            ), _structured([], False)
 
         capped_note = (
             " (truncated to limit)" if len(values) >= limit else ""
@@ -4153,7 +4396,7 @@ class AnchorageGISPlugin(DataPlugin):
             f"where=\"{field}='<paste a value above>'\", limit=1)` "
             "to count records with that value.",
         ]
-        return "\n".join(lines)
+        return "\n".join(lines), _structured(values, bool(capped_note))
 
     async def _find_parcel(self, args: Dict[str, Any]) -> str:
         """Look up a parcel across MOA format variants in one call.
@@ -4528,7 +4771,15 @@ class AnchorageGISPlugin(DataPlugin):
         area = sum(pyclipper.Area(p) for p in solution)
         return abs(area) / (cls.CLIP_SCALE**2)
 
-    async def _footprint_for_parcel(self, args: Dict[str, Any]) -> str:
+    async def _footprint_for_parcel(
+        self, args: Dict[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Lot coverage and footprint headroom for a single parcel.
+
+        Returns (text, structured) conforming to
+        FOOTPRINT_OUTPUT_SCHEMA. Unlike the table tools this one
+        answers about ONE parcel, so the payload carries `result`
+        (an object, or null when no parcel matched) not `rows`."""
         """Real lot coverage + ADU footprint headroom for one parcel.
 
         Spatially joins MOA building footprints to the parcel polygon
@@ -4586,7 +4837,22 @@ class AnchorageGISPlugin(DataPlugin):
                 f"Try `find_parcel(item_id='{parcel_item_id}', "
                 f"parcel_field='Parcel_ID', parcel_id='{parcel_id}')` "
                 f"-- its LIKE fallback surfaces near-miss candidates._",
-            ])
+            ]), {
+                "query": {"parcel_id": parcel_id},
+                "result": None,
+                "caveats": [
+                    {
+                        "code": "parcel_not_found",
+                        "count": len(variants),
+                        "message": (
+                            f"No assessment record matched "
+                            f"{parcel_id!r} in the parcel layer "
+                            f"after trying {len(variants)} MOA "
+                            f"format variants."
+                        ),
+                    }
+                ],
+            }
 
         distinct_ids = {
             (f.get("attributes") or {}).get("Parcel_ID")
@@ -4612,7 +4878,21 @@ class AnchorageGISPlugin(DataPlugin):
                     f"{a.get('Parcel_Address')}{unit_txt}  "
                     f"({a.get('Land_Use')})"
                 )
-            return "\n".join(lines)
+            return "\n".join(lines), {
+                "query": {"parcel_id": parcel_id},
+                "result": None,
+                "caveats": [
+                    {
+                        "code": "parcel_ambiguous",
+                        "count": len(features),
+                        "message": (
+                            f"{len(features)} parcels matched "
+                            f"{parcel_id!r}; pass one of the exact "
+                            f"Parcel_IDs listed to get a single answer."
+                        ),
+                    }
+                ],
+            }
 
         feat = features[0]
         attrs = feat.get("attributes") or {}
@@ -4638,7 +4918,21 @@ class AnchorageGISPlugin(DataPlugin):
                 "coverage and ADU headroom are undefined for it. For "
                 "a condo, the buildable envelope belongs to the "
                 "common-interest parcel, not the unit._",
-            ])
+            ]), {
+                "query": {"parcel_id": parcel_id},
+                "result": None,
+                "caveats": [
+                    {
+                        "code": "no_independent_lot",
+                        "message": (
+                            f"Parcel {canonical_id} ({addr}) has no "
+                            f"independent lot area on the assessor "
+                            f"record, so lot coverage is undefined "
+                            f"for it."
+                        ),
+                    }
+                ],
+            }
 
         geom = feat.get("geometry") or {}
         rings = geom.get("rings") or []
@@ -4760,42 +5054,74 @@ class AnchorageGISPlugin(DataPlugin):
         if note3_applies:
             headroom_note3 = lot_sqft * self.NOTE3_CAP - footprint_sqft
 
-        caveats = [
-            "_Footprint is building polygons **clipped to the parcel** "
-            "and unioned (shared attached-housing polygons are not "
-            "dumped whole onto one lot); areas computed in EPSG:3338 "
-            "(equal-area), never from Web-Mercator `Shape__Area`._",
-            "_Headroom is the **footprint** envelope under the "
-            "coverage cap only. Setbacks and the ADU floor-area cap "
-            "(AMC 21.05.070D.1: greater of 900 sqft or 40% of the "
-            "principal dwelling's floor area, max 1,200 sqft) are "
-            "separate constraints -- footprint headroom alone does "
-            "not mean an ADU fits._",
+        # Structured caveats; the italic notes appended to the rendering
+        # are generated from this same list further down, so the two
+        # cannot drift. Messages are plain text for structured consumers.
+        caveats: List[Dict[str, Any]] = [
+            {
+                "code": "footprint_methodology",
+                "message": (
+                    "Footprint is building polygons clipped to the "
+                    "parcel and unioned (shared attached-housing "
+                    "polygons are not dumped whole onto one lot); areas "
+                    "computed in EPSG:3338 (equal-area), never from "
+                    "Web-Mercator Shape__Area."
+                ),
+            },
+            {
+                "code": "headroom_is_footprint_only",
+                "message": (
+                    "Headroom is the footprint envelope under the "
+                    "coverage cap only. Setbacks and the ADU floor-area "
+                    "cap (AMC 21.05.070D.1: greater of 900 sqft or 40% "
+                    "of the principal dwelling's floor area, max 1,200 "
+                    "sqft) are separate constraints -- footprint "
+                    "headroom alone does not mean an ADU fits."
+                ),
+            },
         ]
         if note3_applies:
             caveats.append(
-                "_The note-3 50% figure is **conditional**: it "
-                "requires the principal structure to be under 16 ft "
-                "tall, which cannot be verified from GIS data "
-                "(`ELEVATION` on the buildings layer is ground "
-                "elevation, not height)._"
+                {
+                    "code": "note3_conditional",
+                    "message": (
+                        "The note-3 50% figure is conditional: it "
+                        "requires the principal structure to be under "
+                        "16 ft tall, which cannot be verified from GIS "
+                        "data (ELEVATION on the buildings layer is "
+                        "ground elevation, not height)."
+                    ),
+                }
             )
         if cap_note:
-            caveats.append(f"_Cap: {cap_note}._")
+            caveats.append(
+                {"code": "cap_source", "message": f"Cap: {cap_note}."}
+            )
         if lot_sqft > 0 and abs(parcel_geom_sqft - lot_sqft) > (
             0.15 * lot_sqft
         ):
             caveats.append(
-                f"_The mapped parcel polygon measures "
-                f"{parcel_geom_sqft:,.0f} sqft vs the assessor "
-                f"Lot_Size of {lot_sqft:,.0f} sqft (>15% apart). "
-                f"Coverage uses the assessor figure; treat results "
-                f"with care._"
+                {
+                    "code": "lot_area_disagreement",
+                    "message": (
+                        f"The mapped parcel polygon measures "
+                        f"{parcel_geom_sqft:,.0f} sqft vs the assessor "
+                        f"Lot_Size of {lot_sqft:,.0f} sqft (>15% apart). "
+                        f"Coverage uses the assessor figure; treat "
+                        f"results with care."
+                    ),
+                }
             )
         if len(bldg_feats) >= self.FOOTPRINT_BUILDING_LIMIT:
             caveats.append(
-                f"_Hit the {self.FOOTPRINT_BUILDING_LIMIT}-building "
-                f"fetch cap; the footprint may be undercounted._"
+                {
+                    "code": "building_cap_reached",
+                    "limit": self.FOOTPRINT_BUILDING_LIMIT,
+                    "message": (
+                        f"Hit the {self.FOOTPRINT_BUILDING_LIMIT}-building "
+                        f"fetch cap; the footprint may be undercounted."
+                    ),
+                }
             )
 
         payload: Dict[str, Any] = {
@@ -4869,12 +5195,16 @@ class AnchorageGISPlugin(DataPlugin):
             "```",
             "",
         ]
-        lines.extend(caveats)
-        return "\n".join(lines)
+        lines.extend(f"_{c['message']}_" for c in caveats)
+        return "\n".join(lines), {
+            "query": {"parcel_id": parcel_id},
+            "result": payload,
+            "caveats": caveats,
+        }
 
     async def _find_features_spanning_classifications(
         self, args: Dict[str, Any]
-    ) -> str:
+    ) -> Tuple[str, Dict[str, Any]]:
         """Find source features whose footprint touches >= min_distinct
         distinct values of a classification field in another polygon
         layer. The "split-zoned parcel" pattern, generalised."""
@@ -5078,7 +5408,33 @@ class AnchorageGISPlugin(DataPlugin):
                 f"source layer has 0 features matching source_where "
                 f"({source_where!r}). Nothing to spatially join "
                 f"against."
-            )
+            ), {
+                "query": {
+                    "source_item_id": source_item_id,
+                    "classification_item_id": classification_item_id,
+                    "classification_field": classification_field,
+                    "source_where": source_where,
+                    "min_distinct": min_distinct,
+                    "limit": limit,
+                },
+                "summary": {
+                    "source_features": 0,
+                    "qualifying": 0,
+                    "returned": 0,
+                },
+                "rows": [],
+                "caveats": [
+                    {
+                        "code": "no_source_features",
+                        "count": 0,
+                        "message": (
+                            f"The source layer has 0 features matching "
+                            f"source_where ({source_where!r}); there was "
+                            f"nothing to spatially join against."
+                        ),
+                    }
+                ],
+            }
 
         cls_polys = await self._paged_geojson_fetch(
             classification_url,
@@ -5314,7 +5670,37 @@ class AnchorageGISPlugin(DataPlugin):
                 f"`source_where`, or confirming the classification "
                 f"layer has the expected boundary detail._"
             )
-            return "\n".join(lines)
+            return "\n".join(lines), {
+                "query": {
+                    "source_item_id": source_item_id,
+                    "classification_item_id": classification_item_id,
+                    "classification_field": classification_field,
+                    "source_where": source_where,
+                    "min_distinct": min_distinct,
+                    "limit": limit,
+                },
+                "summary": {
+                    "source_features": source_count,
+                    "qualifying": 0,
+                    "returned": 0,
+                },
+                "rows": [],
+                "caveats": [
+                    {
+                        "code": "none_qualifying",
+                        "count": 0,
+                        "limit": min_distinct,
+                        "message": (
+                            f"No source feature touches >= "
+                            f"{min_distinct} distinct "
+                            f"{classification_field} values. Lower "
+                            f"min_distinct, broaden source_where, or "
+                            f"confirm the classification layer has the "
+                            f"expected boundary detail."
+                        ),
+                    }
+                ],
+            }
 
         # Fetch attributes for the qualifying subset, capped at limit.
         # Sort by descending distinct-value count so the most-split
@@ -5487,7 +5873,41 @@ class AnchorageGISPlugin(DataPlugin):
                 f"`source_where`, or (3) ask for fewer results "
                 f"(`limit=5`)."
             )
-            return "\n".join(lines)
+            return "\n".join(lines), {
+                "query": {
+                    "source_item_id": source_item_id,
+                    "classification_item_id": classification_item_id,
+                    "classification_field": classification_field,
+                    "source_where": source_where,
+                    "min_distinct": min_distinct,
+                    "limit": limit,
+                },
+                "summary": {
+                    "source_features": source_count,
+                    "qualifying": len(qualifying),
+                    "returned": 0,
+                },
+                # Deliberately empty: the qualifying OBJECTIDs are known
+                # but their real attributes are not, and OBJECTIDs are
+                # internal row numbers. Emitting them as rows invites a
+                # caller to report them as parcel numbers.
+                "rows": [],
+                "caveats": [
+                    {
+                        "code": "attribute_lookup_failed",
+                        "count": len(qualifying),
+                        "message": (
+                            f"Found {len(qualifying)} qualifying "
+                            f"feature(s) but could not fetch their "
+                            f"attributes ({reason}). Internal OBJECTIDs "
+                            f"are withheld: they are not parcel numbers "
+                            f"or any identifier a user would recognize. "
+                            f"Retry in 60s, narrow source_where, or ask "
+                            f"for fewer results."
+                        ),
+                    }
+                ],
+            }
 
         for oid in qualifying_oids:
             attrs = features_by_oid.get(oid)
@@ -5534,7 +5954,73 @@ class AnchorageGISPlugin(DataPlugin):
             "case-sensitive. Pass them verbatim if you filter on "
             "them next._",
         ]
-        return "\n".join(lines)
+
+        span_caveats: List[Dict[str, Any]] = []
+        if len(qualifying) > showing:
+            span_caveats.append(
+                {
+                    "code": "results_capped",
+                    "count": len(qualifying),
+                    "limit": limit,
+                    "message": (
+                        f"{len(qualifying):,} features qualify but only "
+                        f"{showing} are listed (limit={limit}), sorted "
+                        f"by descending distinct-value count."
+                    ),
+                }
+            )
+        if fallback_used:
+            span_caveats.append(
+                {
+                    "code": "attribute_fallback_used",
+                    "count": fallback_recovered,
+                    "message": (
+                        f"The bulk attribute fetch failed; attributes "
+                        f"were recovered one-by-one for "
+                        f"{fallback_recovered} of {showing} feature(s)."
+                    ),
+                }
+            )
+
+        rows: List[Dict[str, Any]] = []
+        for oid in qualifying_oids:
+            attrs = features_by_oid.get(oid)
+            rows.append(
+                {
+                    "objectid": oid,
+                    "distinct_count": len(qualifying[oid]),
+                    # Native format, case-sensitive: these are what a
+                    # follow-up WHERE clause must match verbatim.
+                    "values": sorted(str(v) for v in qualifying[oid]),
+                    "attributes": (
+                        {
+                            k: v
+                            for k, v in attrs.items()
+                            if k not in ("OBJECTID", "OID", "FID")
+                        }
+                        if attrs
+                        else None
+                    ),
+                }
+            )
+
+        return "\n".join(lines), {
+            "query": {
+                "source_item_id": source_item_id,
+                "classification_item_id": classification_item_id,
+                "classification_field": classification_field,
+                "source_where": source_where,
+                "min_distinct": min_distinct,
+                "limit": limit,
+            },
+            "summary": {
+                "source_features": source_count,
+                "qualifying": len(qualifying),
+                "returned": len(rows),
+            },
+            "rows": rows,
+            "caveats": span_caveats,
+        }
 
     # ── Tool definitions ──────────────────────────────────────────────────
 
@@ -5586,6 +6072,274 @@ class AnchorageGISPlugin(DataPlugin):
     # picker. Clients resolve display names as title -> annotations.title ->
     # name, so these are what a user actually sees. Keyed by the UNPREFIXED
     # tool name, matching the ToolDefinition entries below.
+    # Shared by the four record-listing tools -- query_data,
+    # spatial_query_point, spatial_query_polygon and filter_by_polygon --
+    # because they all render through _format_query_results.
+    QUERY_RESULT_OUTPUT_SCHEMA = {
+        "type": "object",
+        "required": ["query", "summary", "rows", "caveats"],
+        "additionalProperties": False,
+        "properties": {
+            "query": {
+                "type": "object",
+                "description": (
+                    "What was asked. Tools that add their own context "
+                    "(filter_by_polygon's container layer) put it here, "
+                    "so extra properties are allowed."
+                ),
+                "properties": {
+                    "item_id": {"type": ["string", "null"]},
+                    "service_url": {"type": ["string", "null"]},
+                    "where": {"type": ["string", "null"]},
+                    "out_fields": {"type": ["string", "null"]},
+                    "limit": {"type": "integer", "minimum": 0},
+                    "geometry_type": {"type": ["string", "null"]},
+                },
+            },
+            "summary": {
+                "type": "object",
+                "required": ["returned", "total_count", "truncated"],
+                "properties": {
+                    "returned": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Records in `rows`.",
+                    },
+                    "total_count": {
+                        "type": ["integer", "null"],
+                        "minimum": 0,
+                        "description": (
+                            "Records matching the WHERE clause -- the "
+                            "answer to 'how many?'. null when the tool "
+                            "does not paginate (the spatial_* tools), "
+                            "in which case `returned` is the whole set."
+                        ),
+                    },
+                    "truncated": {
+                        "type": "boolean",
+                        "description": (
+                            "True when total_count exceeds returned, so "
+                            "`rows` is a sample and must not be used for "
+                            "counts or percentages."
+                        ),
+                    },
+                },
+            },
+            "rows": {
+                "type": "array",
+                "description": (
+                    "Raw field values in the layer's own types: dates "
+                    "are epoch milliseconds and coded fields carry their "
+                    "stored codes, NOT the decoded labels the prose "
+                    "shows. Use `coded_domains` to decode. Any geometry "
+                    "is under `__geometry__` as full GeoJSON -- not the "
+                    "character-clipped form the text renders."
+                ),
+                "items": {"type": "object"},
+            },
+            "coded_domains": {
+                "type": "object",
+                "description": (
+                    "field -> {stored code: label}, present only for "
+                    "layers that declare coded-value domains."
+                ),
+                "additionalProperties": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+            "caveats": _CAVEATS_SCHEMA,
+        },
+    }
+
+    DISTINCT_VALUES_OUTPUT_SCHEMA = {
+        "type": "object",
+        "required": ["query", "summary", "values", "caveats"],
+        "additionalProperties": False,
+        "properties": {
+            "query": {
+                "type": "object",
+                "required": ["item_id", "field", "limit"],
+                "properties": {
+                    "item_id": {"type": "string"},
+                    "field": {"type": "string"},
+                    "where": {"type": ["string", "null"]},
+                    "like": {"type": ["string", "null"]},
+                    "limit": {"type": "integer", "minimum": 0},
+                },
+            },
+            "summary": {
+                "type": "object",
+                "required": ["returned", "truncated"],
+                "properties": {
+                    "returned": {"type": "integer", "minimum": 0},
+                    "truncated": {"type": "boolean"},
+                },
+            },
+            "values": {
+                "type": "array",
+                "description": (
+                    "The EXACT values the layer stores, in their native "
+                    "types, deliberately not normalized -- a WHERE "
+                    "clause must match them verbatim and matching is "
+                    "case-sensitive."
+                ),
+                "items": {
+                    "type": ["string", "number", "boolean", "null"]
+                },
+            },
+            "caveats": _CAVEATS_SCHEMA,
+        },
+    }
+
+    SPANNING_OUTPUT_SCHEMA = {
+        "type": "object",
+        "required": ["query", "summary", "rows", "caveats"],
+        "additionalProperties": False,
+        "properties": {
+            "query": {
+                "type": "object",
+                "required": [
+                    "source_item_id",
+                    "classification_item_id",
+                    "classification_field",
+                    "min_distinct",
+                    "limit",
+                ],
+                "properties": {
+                    "source_item_id": {"type": "string"},
+                    "classification_item_id": {"type": "string"},
+                    "classification_field": {"type": "string"},
+                    "source_where": {"type": ["string", "null"]},
+                    "min_distinct": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 0},
+                },
+            },
+            "summary": {
+                "type": "object",
+                "required": ["source_features", "qualifying", "returned"],
+                "properties": {
+                    "source_features": {"type": "integer", "minimum": 0},
+                    "qualifying": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": (
+                            "Features meeting min_distinct. May exceed "
+                            "`returned`, which is capped by limit."
+                        ),
+                    },
+                    "returned": {"type": "integer", "minimum": 0},
+                },
+            },
+            "rows": {
+                "type": "array",
+                "description": (
+                    "Sorted by descending distinct_count. Empty when "
+                    "attributes could not be fetched -- OBJECTIDs are "
+                    "withheld rather than emitted, because they are "
+                    "internal row numbers a caller could mistake for "
+                    "parcel identifiers."
+                ),
+                "items": {
+                    "type": "object",
+                    "required": ["objectid", "distinct_count", "values"],
+                    "properties": {
+                        "objectid": {"type": ["integer", "string"]},
+                        "distinct_count": {
+                            "type": "integer",
+                            "minimum": 0,
+                        },
+                        "values": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "attributes": {
+                            "type": ["object", "null"],
+                            "description": (
+                                "null when this row's attributes could "
+                                "not be recovered."
+                            ),
+                        },
+                    },
+                },
+            },
+            "caveats": _CAVEATS_SCHEMA,
+        },
+    }
+
+    FOOTPRINT_OUTPUT_SCHEMA = {
+        "type": "object",
+        "required": ["query", "result", "caveats"],
+        "additionalProperties": False,
+        "properties": {
+            "query": {
+                "type": "object",
+                "required": ["parcel_id"],
+                "properties": {"parcel_id": {"type": "string"}},
+            },
+            "result": {
+                "type": ["object", "null"],
+                "description": (
+                    "One parcel, not a table -- hence `result` rather "
+                    "than `rows`. null when no parcel matched, the match "
+                    "was ambiguous, or the parcel has no independent "
+                    "lot; the caveat code says which."
+                ),
+                "properties": {
+                    "parcel_id": {"type": ["string", "null"]},
+                    "address": {"type": ["string", "null"]},
+                    "zoning_district": {"type": ["string", "null"]},
+                    "zoning_district_base": {"type": ["string", "null"]},
+                    "land_use": {"type": ["string", "null"]},
+                    "total_living_units": {
+                        "type": ["integer", "number", "string", "null"]
+                    },
+                    "lot_size_sqft": {"type": "number", "minimum": 0},
+                    "existing_footprint_sqft": {
+                        "type": "number",
+                        "minimum": 0,
+                    },
+                    "coverage_pct": {
+                        "type": "number",
+                        "minimum": 0,
+                        "description": (
+                            "A RATIO (0.42 = 42%), not a percentage, "
+                            "and uncapped."
+                        ),
+                    },
+                    "district_max_coverage": {
+                        "type": ["number", "null"],
+                        "description": (
+                            "null when the district has no mapped "
+                            "coverage cap, which also makes "
+                            "max_footprint_sqft and the headroom fields "
+                            "null."
+                        ),
+                    },
+                    "max_footprint_sqft": {"type": ["number", "null"]},
+                    "adu_footprint_headroom_sqft": {
+                        "type": ["number", "null"],
+                        "description": (
+                            "May be NEGATIVE when the lot is already "
+                            "over its cap."
+                        ),
+                    },
+                    "building_count": {
+                        "type": ["integer", "number", "string", "null"]
+                    },
+                    "buildings_intersecting": {
+                        "type": "integer",
+                        "minimum": 0,
+                    },
+                    "headroom_if_note3_50pct": {"type": "number"},
+                    "note3_conditional": {"type": "string"},
+                    "cap_source": {"type": "string"},
+                },
+            },
+            "caveats": _CAVEATS_SCHEMA,
+        },
+    }
+
     AGGREGATE_OUTPUT_SCHEMA = {
         "type": "object",
         "required": ["query", "summary", "rows", "caveats"],
@@ -5822,6 +6576,15 @@ class AnchorageGISPlugin(DataPlugin):
     TOOL_OUTPUT_SCHEMAS = {
         "aggregate_by_polygon": AGGREGATE_OUTPUT_SCHEMA,
         "coverage_by_polygon": COVERAGE_OUTPUT_SCHEMA,
+        # All four render through _format_query_results, so they share
+        # one schema.
+        "query_data": QUERY_RESULT_OUTPUT_SCHEMA,
+        "spatial_query_point": QUERY_RESULT_OUTPUT_SCHEMA,
+        "spatial_query_polygon": QUERY_RESULT_OUTPUT_SCHEMA,
+        "filter_by_polygon": QUERY_RESULT_OUTPUT_SCHEMA,
+        "get_distinct_values": DISTINCT_VALUES_OUTPUT_SCHEMA,
+        "find_features_spanning_classifications": SPANNING_OUTPUT_SCHEMA,
+        "footprint_for_parcel": FOOTPRINT_OUTPUT_SCHEMA,
     }
 
     def get_tools(self) -> List[ToolDefinition]:
@@ -7066,7 +7829,7 @@ class AnchorageGISPlugin(DataPlugin):
                 text = await self._get_layer_schema(arguments)
 
             elif tool_name == "get_distinct_values":
-                text = await self._get_distinct_values(arguments)
+                text, structured = await self._get_distinct_values(arguments)
 
             elif tool_name == "find_parcel":
                 text = await self._find_parcel(arguments)
@@ -7151,7 +7914,7 @@ class AnchorageGISPlugin(DataPlugin):
                     else None
                 )
 
-                text = self._format_query_results(
+                text, structured = self._format_query_results(
                     records,
                     effective_limit,
                     total_count,
@@ -7211,7 +7974,7 @@ class AnchorageGISPlugin(DataPlugin):
                     # line: every match is already in `records`, there
                     # is no paging going on. layer_meta is best-effort;
                     # raw rendering falls through on any failure.
-                    text = self._format_query_results(
+                    text, structured = self._format_query_results(
                         records,
                         limit,
                         total_count=None,
@@ -7287,7 +8050,7 @@ class AnchorageGISPlugin(DataPlugin):
                         f"filter polygon."
                     )
                 else:
-                    text = self._format_query_results(
+                    text, structured = self._format_query_results(
                         records,
                         effective_limit,
                         total_count=None,
@@ -7304,15 +8067,18 @@ class AnchorageGISPlugin(DataPlugin):
                 text, structured = await self._coverage_by_polygon(arguments)
 
             elif tool_name == "filter_by_polygon":
-                text = await self._filter_by_polygon(arguments)
+                text, structured = await self._filter_by_polygon(arguments)
 
             elif tool_name == "find_features_spanning_classifications":
-                text = await self._find_features_spanning_classifications(
+                (
+                    text,
+                    structured,
+                ) = await self._find_features_spanning_classifications(
                     arguments
                 )
 
             elif tool_name == "footprint_for_parcel":
-                text = await self._footprint_for_parcel(arguments)
+                text, structured = await self._footprint_for_parcel(arguments)
 
             else:
                 return ToolResult(
