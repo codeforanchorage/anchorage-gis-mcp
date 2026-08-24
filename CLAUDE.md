@@ -10,7 +10,6 @@ uv sync                              # or: pip install -r requirements.txt
 
 # Run local MCP server (no Lambda needed)
 python3 scripts/local_server.py      # Serves on http://localhost:8000/mcp
-# Or: python3 local_server.py        # Alternate entry point, serves on / and /mcp
 
 # Validate config
 python3 -c "from core.validators import load_and_validate_config; load_and_validate_config('config.yaml')"
@@ -43,7 +42,10 @@ cd client && make build
 **Request flow:**
 ```
 Claude (stdio) → Go client (client/) or stdio_bridge.py → HTTP POST /mcp
-  → Lambda (server/adapters/aws_lambda.py) or local_server.py
+  → Lambda (server/adapters/aws_lambda.py) or scripts/local_server.py
+  → both call UniversalHTTPHandler (server/http_handler.py), so local
+    dev enforces the same Origin allowlist and MCP-Protocol-Version
+    checks as prod
   → server/http_handler.py → core/mcp_server.py (JSON-RPC 2.0)
   → core/plugin_manager.py → Plugin → External API
 ```

@@ -52,10 +52,14 @@ python3 scripts/local_server.py
 ```
 
 **What it does:**
-- Starts a local HTTP server on `http://localhost:8000/mcp`
+- Starts a local HTTP server on `http://localhost:8000/mcp` (and `/mcp-gcc`)
 - Supports Streamable HTTP transport with session management
 - Provides detailed logging for debugging
-- Uses the same MCP server logic as Lambda deployment
+- Routes through `UniversalHTTPHandler`, the exact entry point the Lambda
+  adapter uses. Local dev therefore enforces the same Origin allowlist,
+  `MCP-Protocol-Version` validation, path/method checks and CORS as
+  production, so a regression in any of them fails locally instead of
+  only after deploy.
 
 **Requirements:**
 - Python 3.11+
