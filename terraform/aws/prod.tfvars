@@ -5,8 +5,12 @@ config_file = "config.yaml"
 # 1024 MB: aggregate_by_polygon holds up to AGG_SOURCE_LIMIT source features in
 # memory plus a bounded 32-entry polygon cache. Also buys more Lambda
 # CPU, which accelerates the pure-Python point-in-polygon work.
-lambda_memory   = 1024
-lambda_timeout  = 120
+lambda_memory = 1024
+# Kept in sync with config.yaml, which WINS for this variable (main.tf reads
+# `local.config.aws.lambda_timeout` first and only falls back to this var).
+# 28s sits just under API Gateway's hard, non-adjustable 29s integration
+# timeout so the Lambda self-terminates before the gateway gives up.
+lambda_timeout  = 28
 api_quota_limit = 3000
 # Rate/burst feed BOTH the stage-wide throttle (the aggregate cap on the
 # keyless public /mcp) and the usage-plan throttle (API-key traffic).

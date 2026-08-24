@@ -106,7 +106,9 @@ aws:
   region: "us-west-2"
   lambda_name: "anchorage-gis-mcp"
   lambda_memory: 512
-  lambda_timeout: 120
+  # Must stay under API Gateway's hard 29s integration timeout; see
+  # config.yaml for the full rationale.
+  lambda_timeout: 28
 
 logging:
   level: "INFO"
