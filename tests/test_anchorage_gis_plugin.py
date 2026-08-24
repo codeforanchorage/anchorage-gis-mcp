@@ -1144,7 +1144,7 @@ class TestAggregateByPolygon:
             new_callable=AsyncMock,
             return_value=source_features,
         ):
-            text = await plugin._aggregate_by_polygon(
+            text, _ = await plugin._aggregate_by_polygon(
                 {
                     "source_item_id": _SOURCE_ID,
                     "aggregation_item_id": _AGG_ID,
@@ -4237,7 +4237,7 @@ class TestAggregateByPolygonBuffer:
     async def test_point_outside_unmatched_without_buffer(self, plugin):
         p1, p2, p3, p4 = self._patches(plugin)
         with p1, p2, p3, p4:
-            text = await plugin._aggregate_by_polygon(
+            text, _ = await plugin._aggregate_by_polygon(
                 {
                     "source_item_id": _SOURCE_ID,
                     "aggregation_item_id": _AGG_ID,
@@ -4250,7 +4250,7 @@ class TestAggregateByPolygonBuffer:
     async def test_point_matched_within_half_mile_buffer(self, plugin):
         p1, p2, p3, p4 = self._patches(plugin)
         with p1, p2, p3, p4:
-            text = await plugin._aggregate_by_polygon(
+            text, _ = await plugin._aggregate_by_polygon(
                 {
                     "source_item_id": _SOURCE_ID,
                     "aggregation_item_id": _AGG_ID,
@@ -4268,7 +4268,7 @@ class TestAggregateByPolygonBuffer:
         # 0.1 mi buffer (~161 m) is far short of the ~620 m gap.
         p1, p2, p3, p4 = self._patches(plugin)
         with p1, p2, p3, p4:
-            text = await plugin._aggregate_by_polygon(
+            text, _ = await plugin._aggregate_by_polygon(
                 {
                     "source_item_id": _SOURCE_ID,
                     "aggregation_item_id": _AGG_ID,
@@ -4422,7 +4422,7 @@ class TestCoverageByPolygon:
         ]
         p1, p2, p3, p4 = self._patches(plugin, targets, overlay)
         with p1, p2, p3, p4:
-            text = await plugin._coverage_by_polygon({
+            text, _ = await plugin._coverage_by_polygon({
                 "target_item_id": "a" * 32,
                 "overlay_item_id": "b" * 32,
                 "target_id_field": "Parcel_ID",
@@ -4441,7 +4441,7 @@ class TestCoverageByPolygon:
         overlay = [self._bldg(1, 0.5, 100.0), self._bldg(2, 2.5, 100.0)]
         p1, p2, p3, p4 = self._patches(plugin, targets, overlay)
         with p1, p2, p3, p4:
-            text = await plugin._coverage_by_polygon({
+            text, _ = await plugin._coverage_by_polygon({
                 "target_item_id": "a" * 32,
                 "overlay_item_id": "b" * 32,
                 "target_id_field": "Parcel_ID",
@@ -4463,7 +4463,7 @@ class TestCoverageByPolygon:
         ]
         p1, p2, p3, p4 = self._patches(plugin, targets, overlay)
         with p1, p2, p3, p4:
-            text = await plugin._coverage_by_polygon({
+            text, _ = await plugin._coverage_by_polygon({
                 "target_item_id": "a" * 32,
                 "overlay_item_id": "b" * 32,
                 "target_id_field": "Parcel_ID",
@@ -4480,7 +4480,7 @@ class TestCoverageByPolygon:
         targets = [self._target("A", 1000.0, 0)]
         p1, p2, p3, p4 = self._patches(plugin, targets, [])
         with p1, p2, p3, p4:
-            text = await plugin._coverage_by_polygon({
+            text, _ = await plugin._coverage_by_polygon({
                 "target_item_id": "a" * 32,
                 "overlay_item_id": "b" * 32,
                 "target_id_field": "Parcel_ID",
@@ -4495,7 +4495,7 @@ class TestCoverageByPolygon:
         overlay = [self._bldg(1, 0.5, 100.0)]
         p1, p2, p3, p4 = self._patches(plugin, targets, overlay)
         with p1, p2, p3, p4:
-            text = await plugin._coverage_by_polygon({
+            text, _ = await plugin._coverage_by_polygon({
                 "target_item_id": "a" * 32,
                 "overlay_item_id": "b" * 32,
                 "target_id_field": "Parcel_ID",

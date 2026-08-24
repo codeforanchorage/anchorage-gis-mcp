@@ -3132,7 +3132,15 @@ class AnchorageGISPlugin(DataPlugin):
                 break
         return features
 
-    async def _aggregate_by_polygon(self, args: Dict[str, Any]) -> str:
+    async def _aggregate_by_polygon(
+        self, args: Dict[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Aggregate source features into polygon buckets.
+
+        Returns (rendered_markdown, structured_result). The structured
+        half conforms to AGGREGATE_OUTPUT_SCHEMA, which is declared as
+        the tool's outputSchema -- so any change to its shape is a
+        breaking protocol change, not just an internal refactor."""
         source_item_id = self._validate_item_id(
             (args.get("source_item_id") or "").strip()
         )
@@ -3345,6 +3353,35 @@ class AnchorageGISPlugin(DataPlugin):
             if buffer_m > 0
             else "none"
         )
+
+        # Structured twin of the rendering below. Assembled here so the
+        # empty-result path and the normal path cannot emit different
+        # shapes -- a declared outputSchema has to hold on every branch.
+        agg_query: Dict[str, Any] = {
+            "source_item_id": source_item_id,
+            "aggregation_item_id": aggregation_item_id,
+            "group_by_field": group_by_field,
+            "source_geometry_type": source_geom_type,
+            "centroid_mode": centroid_mode,
+            "overlap_policy": overlap_policy,
+            "sum_fields": list(sum_fields),
+            "count": include_count,
+            "buffer": (
+                {
+                    "distance": float(raw_buffer),
+                    "units": buffer_units_canonical,
+                    "meters": buffer_m,
+                }
+                if buffer_m > 0
+                else None
+            ),
+        }
+        agg_summary: Dict[str, Any] = {
+            "source_features": len(source_points),
+            "buckets": len(bucket_list),
+            "unmatched": unmatched_count,
+        }
+        agg_caveats: List[Dict[str, Any]] = []
         lines = [
             f"## Aggregation: {source_item_id} -> {aggregation_item_id}",
             f"**City:** {city}  |  **Group field:** `{group_by_field}`",
@@ -3361,7 +3398,23 @@ class AnchorageGISPlugin(DataPlugin):
             lines.append(
                 "_No source features fell inside any aggregation polygon._"
             )
-            return "\n".join(lines)
+            self._append_aggregate_caveats(
+                agg_caveats,
+                small_bucket_seen=False,
+                unmatched_count=unmatched_count,
+                buffer_m=buffer_m,
+                buffer_label=buffer_label,
+                fetched=len(source_features),
+                max_source=max_source,
+            )
+            for caveat in agg_caveats:
+                lines += ["", f"_{caveat['message']}_"]
+            return "\n".join(lines), {
+                "query": agg_query,
+                "summary": agg_summary,
+                "rows": [],
+                "caveats": agg_caveats,
+            }
 
         header_cols = ["Group"]
         if include_count:
@@ -3386,37 +3439,100 @@ class AnchorageGISPlugin(DataPlugin):
                 else:
                     row.append(f"{val:,}")
             lines.append("| " + " | ".join(row) + " |")
-        if small_bucket_seen:
-            lines += [
-                "",
-                f"_Buckets tagged_ **(small sample)** _hold fewer than "
-                f"{self.SMALL_SAMPLE_THRESHOLD} source features. "
-                f"Percentages and shares computed on these buckets are "
-                f"weak -- name the count, not the percent, when "
-                f"summarizing._",
-            ]
+        self._append_aggregate_caveats(
+            agg_caveats,
+            small_bucket_seen=small_bucket_seen,
+            unmatched_count=unmatched_count,
+            buffer_m=buffer_m,
+            buffer_label=buffer_label,
+            fetched=len(source_features),
+            max_source=max_source,
+        )
+        # The italic notes and the structured caveats are rendered from the
+        # same list, so the two can never disagree about what qualified a
+        # result.
+        for caveat in agg_caveats:
+            lines += ["", f"_{caveat['message']}_"]
 
+        rows: List[Dict[str, Any]] = []
+        for group, bucket in bucket_list:
+            row: Dict[str, Any] = {
+                "group": group,
+                "sums": {f: bucket[f] for f in sum_fields},
+            }
+            if include_count:
+                row["count"] = bucket["count"]
+                row["small_sample"] = (
+                    bucket["count"] < self.SMALL_SAMPLE_THRESHOLD
+                )
+            rows.append(row)
+
+        return "\n".join(lines), {
+            "query": agg_query,
+            "summary": agg_summary,
+            "rows": rows,
+            "caveats": agg_caveats,
+        }
+
+    def _append_aggregate_caveats(
+        self,
+        caveats: List[Dict[str, Any]],
+        *,
+        small_bucket_seen: bool,
+        unmatched_count: int,
+        buffer_m: float,
+        buffer_label: str,
+        fetched: int,
+        max_source: int,
+    ) -> None:
+        """Append the qualifications that apply to an aggregation result.
+
+        Messages are plain text, not markdown: they are consumed verbatim
+        by structured clients and only wrapped in italics for rendering.
+        """
+        if small_bucket_seen:
+            caveats.append(
+                {
+                    "code": "small_sample_buckets",
+                    "limit": self.SMALL_SAMPLE_THRESHOLD,
+                    "message": (
+                        f"Buckets tagged (small sample) hold fewer than "
+                        f"{self.SMALL_SAMPLE_THRESHOLD} source features. "
+                        f"Percentages and shares computed on these buckets "
+                        f"are weak -- name the count, not the percent, when "
+                        f"summarizing."
+                    ),
+                }
+            )
         if unmatched_count:
             outside_what = (
-                f"farther than {buffer_label} from every aggregation "
-                f"polygon"
+                f"farther than {buffer_label} from every aggregation polygon"
                 if buffer_m > 0
                 else "outside every aggregation polygon"
             )
-            lines += [
-                "",
-                f"_{unmatched_count:,} source feature(s) fell "
-                f"{outside_what}. This usually indicates "
-                f"data-quality signal (stray coordinates, records "
-                f"outside the city boundary)._",
-            ]
-        if len(source_features) >= max_source:
-            lines += [
-                "",
-                f"_Source fetch hit the {max_source:,}-feature cap. "
-                f"Narrow source_where to get a complete picture._",
-            ]
-        return "\n".join(lines)
+            caveats.append(
+                {
+                    "code": "unmatched_source_features",
+                    "count": unmatched_count,
+                    "message": (
+                        f"{unmatched_count:,} source feature(s) fell "
+                        f"{outside_what}. This usually indicates "
+                        f"data-quality signal (stray coordinates, records "
+                        f"outside the city boundary)."
+                    ),
+                }
+            )
+        if fetched >= max_source:
+            caveats.append(
+                {
+                    "code": "source_cap_reached",
+                    "limit": max_source,
+                    "message": (
+                        f"Source fetch hit the {max_source:,}-feature cap. "
+                        f"Narrow source_where to get a complete picture."
+                    ),
+                }
+            )
 
     # Esri numeric field types eligible to hold an area value.
     _NUMERIC_FIELD_TYPES = frozenset({
@@ -3428,7 +3544,15 @@ class AnchorageGISPlugin(DataPlugin):
         "esriFieldTypeOID",
     })
 
-    async def _coverage_by_polygon(self, args: Dict[str, Any]) -> str:
+    async def _coverage_by_polygon(
+        self, args: Dict[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Measure overlay coverage of each target polygon.
+
+        Returns (rendered_markdown, structured_result). The structured
+        half conforms to COVERAGE_OUTPUT_SCHEMA, declared as the
+        tool's outputSchema -- changing its shape is a breaking
+        protocol change, not an internal refactor."""
         target_item_id = self._validate_item_id(
             (args.get("target_item_id") or "").strip()
         )
@@ -3684,49 +3808,131 @@ class AnchorageGISPlugin(DataPlugin):
                     f"The headline count above is exact._"
                 )
 
-        # Caveats.
-        caveats = [
-            "_Each overlay feature is assigned to the target whose polygon "
-            "contains its **centroid**, and its full area is counted (not "
-            "geometrically clipped), so coverage can exceed 100% on dense "
-            "lots. Good for screening, not survey-grade._",
-            f"_Both areas use the layers' stored `{target_area_field}` / "
-            f"`{overlay_area_field}`; the ratio is valid when both layers "
-            f"share a spatial reference (true for MOA hosted layers)._",
+        # Caveats. Structured objects rather than prose strings: the
+        # rendering below and the `caveats` array of the structured result
+        # are produced from this one list, so they cannot drift. Messages
+        # are plain text -- structured clients consume them verbatim.
+        caveats: List[Dict[str, Any]] = [
+            {
+                "code": "centroid_assignment",
+                "message": (
+                    "Each overlay feature is assigned to the target whose "
+                    "polygon contains its centroid, and its full area is "
+                    "counted (not geometrically clipped), so coverage can "
+                    "exceed 100% on dense lots. Good for screening, not "
+                    "survey-grade."
+                ),
+            },
+            {
+                "code": "area_field_assumption",
+                "message": (
+                    f"Both areas use the layers' stored "
+                    f"{target_area_field} / {overlay_area_field}; the ratio "
+                    f"is valid when both layers share a spatial reference "
+                    f"(true for MOA hosted layers)."
+                ),
+            },
         ]
         if zero_cov:
             caveats.append(
-                f"_{zero_cov:,} target(s) returned **0% coverage** (no "
-                f"overlay feature centroid falls inside) -- vacant land, or "
-                f"outside the overlay layer's extent. Decide whether 0% "
-                f"belongs in your answer._"
+                {
+                    "code": "zero_coverage_targets",
+                    "count": zero_cov,
+                    "message": (
+                        f"{zero_cov:,} target(s) returned 0% coverage (no "
+                        f"overlay feature centroid falls inside) -- vacant "
+                        f"land, or outside the overlay layer's extent. "
+                        f"Decide whether 0% belongs in your answer."
+                    ),
+                }
             )
         if overlay_truncated:
             caveats.append(
-                f"_An overlay batch hit the "
-                f"{self.COVERAGE_OVERLAY_LIMIT:,}-feature fetch cap; coverage "
-                f"for some targets may be undercounted. Narrow target_where._"
+                {
+                    "code": "overlay_cap_reached",
+                    "limit": self.COVERAGE_OVERLAY_LIMIT,
+                    "message": (
+                        f"An overlay batch hit the "
+                        f"{self.COVERAGE_OVERLAY_LIMIT:,}-feature fetch cap; "
+                        f"coverage for some targets may be undercounted. "
+                        f"Narrow target_where."
+                    ),
+                }
             )
         if skipped:
             caveats.append(
-                f"_{skipped:,} target(s) were skipped (missing geometry/area "
-                f"or an upstream query error) and are not in the counts._"
+                {
+                    "code": "targets_skipped",
+                    "count": skipped,
+                    "message": (
+                        f"{skipped:,} target(s) were skipped (missing "
+                        f"geometry/area or an upstream query error) and are "
+                        f"not in the counts."
+                    ),
+                }
             )
         tmeta = await self._safe_layer_meta(target_item_id)
         cov_pct = tmeta.get("coverage_pct")
         if cov_pct is not None and cov_pct < self.COVERAGE_THRESHOLD:
             caveats.append(
-                f"_The target layer's extent covers ~{cov_pct * 100:.0f}% of "
-                f"{city}; targets outside that extent are absent entirely._"
+                {
+                    "code": "partial_layer_extent",
+                    "message": (
+                        f"The target layer's extent covers ~"
+                        f"{cov_pct * 100:.0f}% of {city}; targets outside "
+                        f"that extent are absent entirely."
+                    ),
+                }
             )
         if truncated:
             caveats.append(
-                f"_Hit the {max_targets:,}-target cap. Narrow `target_where` "
-                f"for a complete picture._"
+                {
+                    "code": "target_cap_reached",
+                    "limit": max_targets,
+                    "message": (
+                        f"Hit the {max_targets:,}-target cap. Narrow "
+                        f"target_where for a complete picture."
+                    ),
+                }
             )
         lines.append("")
-        lines.extend(caveats)
-        return "\n".join(lines)
+        lines.extend(f"_{c['message']}_" for c in caveats)
+
+        return "\n".join(lines), {
+            "query": {
+                "target_item_id": target_item_id,
+                "overlay_item_id": overlay_item_id,
+                "target_id_field": target_id_field,
+                "target_area_field": target_area_field,
+                "overlay_area_field": overlay_area_field,
+                "target_where": target_where,
+                "band": {
+                    "min_coverage_pct": min_cov,
+                    "max_coverage_pct": max_cov,
+                },
+            },
+            "summary": {
+                "targets_measured": len(scored),
+                "in_band": len(matched),
+                "out_of_band": len(scored) - len(matched),
+                "zero_coverage": zero_cov,
+                "skipped": skipped,
+            },
+            # EVERY in-band target, not just the COVERAGE_TABLE_ROWS shown
+            # in the table. Truncating the machine-readable channel would
+            # defeat its purpose, and the full set is far under the Lambda
+            # response limit.
+            "rows": [
+                {
+                    "id": r["id"],
+                    "coverage_pct": r["coverage"],
+                    "covered_area": r["covered"],
+                    "target_area": r["area"],
+                }
+                for r in matched
+            ],
+            "caveats": caveats,
+        }
 
     async def _filter_by_polygon(self, args: Dict[str, Any]) -> str:
         source_item_id = self._validate_item_id(
@@ -5332,12 +5538,262 @@ class AnchorageGISPlugin(DataPlugin):
 
     # ── Tool definitions ──────────────────────────────────────────────────
 
+    # ── Structured output ───────────────────────────────────────────
+    #
+    # Declaring an `outputSchema` is a commitment, not a hint: the MCP
+    # spec says servers MUST return structured results that conform to
+    # it, and clients may validate and reject. Every optional field and
+    # edge case below is therefore deliberate -- see the schema tests.
+    #
+    # Emitted inline in both schemas rather than via $ref, so each is
+    # self-contained and no client has to resolve references.
+    _CAVEATS_SCHEMA = {
+        "type": "array",
+        "description": (
+            "Machine-readable qualifications on the result. Present so a "
+            "caller can branch on `code` instead of parsing the prose "
+            "rendering. An empty array means the result is unqualified."
+        ),
+        "items": {
+            "type": "object",
+            "required": ["code", "message"],
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Stable identifier for the caveat.",
+                },
+                "message": {
+                    "type": "string",
+                    "description": "The human-readable form of this caveat.",
+                },
+                "count": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Affected feature/target count, if any.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The cap that was reached, if any.",
+                },
+            },
+        },
+    }
+
     # Human-readable display names. The wire `name` is prefixed
     # (`anchorage_gis__spatial_query_polygon`) because it must be a stable,
     # collision-free identifier; that string reads poorly in a client's tool
     # picker. Clients resolve display names as title -> annotations.title ->
     # name, so these are what a user actually sees. Keyed by the UNPREFIXED
     # tool name, matching the ToolDefinition entries below.
+    AGGREGATE_OUTPUT_SCHEMA = {
+        "type": "object",
+        "required": ["query", "summary", "rows", "caveats"],
+        "additionalProperties": False,
+        "properties": {
+            "query": {
+                "type": "object",
+                "description": "The resolved parameters this run used.",
+                "required": [
+                    "source_item_id",
+                    "aggregation_item_id",
+                    "group_by_field",
+                    "centroid_mode",
+                    "overlap_policy",
+                    "sum_fields",
+                    "count",
+                    "buffer",
+                ],
+                "properties": {
+                    "source_item_id": {"type": "string"},
+                    "aggregation_item_id": {"type": "string"},
+                    "group_by_field": {"type": "string"},
+                    "source_geometry_type": {"type": "string"},
+                    "centroid_mode": {
+                        "enum": ["auto", "centroid", "representative_point"]
+                    },
+                    "overlap_policy": {
+                        "enum": ["first_match", "all_matches", "largest"]
+                    },
+                    "sum_fields": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "count": {"type": "boolean"},
+                    "buffer": {
+                        "type": ["object", "null"],
+                        "description": (
+                            "null when no proximity buffer was applied."
+                        ),
+                        "required": ["distance", "units", "meters"],
+                        "properties": {
+                            "distance": {"type": "number", "minimum": 0},
+                            "units": {"type": "string"},
+                            "meters": {"type": "number", "minimum": 0},
+                        },
+                    },
+                },
+            },
+            "summary": {
+                "type": "object",
+                "required": ["source_features", "buckets", "unmatched"],
+                "properties": {
+                    "source_features": {"type": "integer", "minimum": 0},
+                    "buckets": {"type": "integer", "minimum": 0},
+                    "unmatched": {"type": "integer", "minimum": 0},
+                },
+            },
+            "rows": {
+                "type": "array",
+                "description": (
+                    "One entry per bucket, sorted by count descending -- "
+                    "the same order as the rendered table. Empty when no "
+                    "source feature matched any aggregation polygon."
+                ),
+                "items": {
+                    "type": "object",
+                    "required": ["group", "sums"],
+                    "properties": {
+                        "group": {
+                            "type": ["string", "number", "boolean", "null"],
+                            "description": (
+                                "The group field's raw value. NOT always a "
+                                "string -- it is whatever the aggregation "
+                                "layer stores."
+                            ),
+                        },
+                        "count": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": (
+                                "Omitted when the caller passed count=false."
+                            ),
+                        },
+                        "small_sample": {
+                            "type": "boolean",
+                            "description": (
+                                "True when count is below the small-sample "
+                                "threshold; percentages over this bucket "
+                                "are weak."
+                            ),
+                        },
+                        "sums": {
+                            "type": "object",
+                            "description": (
+                                "Summed value per requested sum_field. "
+                                "Empty when none were requested. Nested "
+                                "because the field names are caller-chosen."
+                            ),
+                            "additionalProperties": {"type": "number"},
+                        },
+                    },
+                },
+            },
+            "caveats": _CAVEATS_SCHEMA,
+        },
+    }
+
+    COVERAGE_OUTPUT_SCHEMA = {
+        "type": "object",
+        "required": ["query", "summary", "rows", "caveats"],
+        "additionalProperties": False,
+        "properties": {
+            "query": {
+                "type": "object",
+                "required": [
+                    "target_item_id",
+                    "overlay_item_id",
+                    "target_id_field",
+                    "target_area_field",
+                    "overlay_area_field",
+                    "band",
+                ],
+                "properties": {
+                    "target_item_id": {"type": "string"},
+                    "overlay_item_id": {"type": "string"},
+                    "target_id_field": {"type": "string"},
+                    "target_area_field": {"type": "string"},
+                    "overlay_area_field": {"type": "string"},
+                    "target_where": {"type": "string"},
+                    "band": {
+                        "type": "object",
+                        "description": (
+                            "Either bound may be null; both null means no "
+                            "coverage filter was applied."
+                        ),
+                        "required": [
+                            "min_coverage_pct",
+                            "max_coverage_pct",
+                        ],
+                        "properties": {
+                            "min_coverage_pct": {
+                                "type": ["number", "null"],
+                                "minimum": 0,
+                            },
+                            "max_coverage_pct": {
+                                "type": ["number", "null"],
+                                "minimum": 0,
+                            },
+                        },
+                    },
+                },
+            },
+            "summary": {
+                "type": "object",
+                "required": [
+                    "targets_measured",
+                    "in_band",
+                    "out_of_band",
+                    "zero_coverage",
+                    "skipped",
+                ],
+                "properties": {
+                    "targets_measured": {"type": "integer", "minimum": 0},
+                    "in_band": {"type": "integer", "minimum": 0},
+                    "out_of_band": {"type": "integer", "minimum": 0},
+                    "zero_coverage": {"type": "integer", "minimum": 0},
+                    "skipped": {"type": "integer", "minimum": 0},
+                },
+            },
+            "rows": {
+                "type": "array",
+                "description": (
+                    "EVERY in-band target, ascending by coverage. The "
+                    "rendered table shows only the lowest-coverage "
+                    "handful; this carries the full set."
+                ),
+                "items": {
+                    "type": "object",
+                    "required": [
+                        "id",
+                        "coverage_pct",
+                        "covered_area",
+                        "target_area",
+                    ],
+                    "properties": {
+                        "id": {"type": ["string", "number", "null"]},
+                        "coverage_pct": {
+                            "type": "number",
+                            "minimum": 0,
+                            "description": (
+                                "Deliberately has no maximum: overlay areas "
+                                "are counted whole rather than clipped to "
+                                "the target, so dense lots legitimately "
+                                "exceed 100."
+                            ),
+                        },
+                        "covered_area": {"type": "number", "minimum": 0},
+                        "target_area": {
+                            "type": "number",
+                            "exclusiveMinimum": 0,
+                        },
+                    },
+                },
+            },
+            "caveats": _CAVEATS_SCHEMA,
+        },
+    }
+
     TOOL_TITLES = {
         "find_gis_content": "Find GIS Content",
         "browse_gallery": "Browse Map Gallery",
@@ -5357,6 +5813,15 @@ class AnchorageGISPlugin(DataPlugin):
             "Find Features Spanning Classifications"
         ),
         "footprint_for_parcel": "Lot Coverage for Parcel",
+    }
+
+    # Tools that return machine-readable results alongside the prose.
+    # Only these two declare an outputSchema; the rest return prose only,
+    # and adding a tool here without also returning structured_content
+    # would break the schema contract, so the pair is tested together.
+    TOOL_OUTPUT_SCHEMAS = {
+        "aggregate_by_polygon": AGGREGATE_OUTPUT_SCHEMA,
+        "coverage_by_polygon": COVERAGE_OUTPUT_SCHEMA,
     }
 
     def get_tools(self) -> List[ToolDefinition]:
@@ -6549,6 +7014,8 @@ class AnchorageGISPlugin(DataPlugin):
                 tool.annotations = {"readOnlyHint": True, "openWorldHint": True}
             if tool.title is None:
                 tool.title = self.TOOL_TITLES.get(tool.name)
+            if tool.output_schema is None:
+                tool.output_schema = self.TOOL_OUTPUT_SCHEMAS.get(tool.name)
         return tools
 
     # ── Tool dispatch ─────────────────────────────────────────────────────
@@ -6556,6 +7023,10 @@ class AnchorageGISPlugin(DataPlugin):
     async def execute_tool(
         self, tool_name: str, arguments: Dict[str, Any]
     ) -> ToolResult:
+        # Only tools that declare an outputSchema set this; it stays None
+        # for the rest, and MCPServer omits `structuredContent` entirely
+        # when it is None.
+        structured: Optional[Dict[str, Any]] = None
         try:
             if tool_name == "find_gis_content":
                 text = await self._find_gis_content(arguments)
@@ -6827,10 +7298,10 @@ class AnchorageGISPlugin(DataPlugin):
                     )
 
             elif tool_name == "aggregate_by_polygon":
-                text = await self._aggregate_by_polygon(arguments)
+                text, structured = await self._aggregate_by_polygon(arguments)
 
             elif tool_name == "coverage_by_polygon":
-                text = await self._coverage_by_polygon(arguments)
+                text, structured = await self._coverage_by_polygon(arguments)
 
             elif tool_name == "filter_by_polygon":
                 text = await self._filter_by_polygon(arguments)
@@ -6855,6 +7326,7 @@ class AnchorageGISPlugin(DataPlugin):
                     {"type": "text", "text": self._with_retrieved_footer(text)}
                 ],
                 success=True,
+                structured_content=structured,
             )
 
         except Exception as e:
