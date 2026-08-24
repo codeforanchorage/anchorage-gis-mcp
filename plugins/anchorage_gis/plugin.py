@@ -19,7 +19,13 @@ from urllib.parse import urlparse
 import httpx
 import pyclipper
 
-from core.interfaces import DataPlugin, PluginType, ToolDefinition, ToolResult
+from core.interfaces import (
+    DataPlugin,
+    PluginType,
+    ToolDefinition,
+    ToolInputError,
+    ToolResult,
+)
 from plugins.anchorage_gis.config_schema import AnchorageGISPluginConfig
 from plugins.arcgis.where_validator import (
     OrderByValidator,
@@ -862,7 +868,7 @@ class AnchorageGISPlugin(DataPlugin):
         configured = (self.plugin_config.org_id or "").lower()
         item_org = (item.get("orgId") or "").lower()
         if not item_org or item_org != configured:
-            raise ValueError(
+            raise ToolInputError(
                 f"Item {item.get('id')!r} belongs to org "
                 f"{item.get('orgId')!r}, not the configured org "
                 f"{self.plugin_config.org_id!r}; this MCP only serves "
@@ -1131,18 +1137,18 @@ class AnchorageGISPlugin(DataPlugin):
         key holding the GeoJSON geometry object.
         """
         if limit < 1:
-            raise ValueError(f"limit must be at least 1 (got {limit})")
+            raise ToolInputError(f"limit must be at least 1 (got {limit})")
 
         item = await self.get_dataset(resource_id)
         service_url = item.get("url", "")
         item_type = item.get("type", "")
 
         if not service_url:
-            raise ValueError(
+            raise ToolInputError(
                 self._not_queryable_message(resource_id, item_type)
             )
         if item_type and item_type not in self.QUERYABLE_TYPES:
-            raise ValueError(
+            raise ToolInputError(
                 self._not_queryable_message(resource_id, item_type)
             )
 
@@ -1243,7 +1249,7 @@ class AnchorageGISPlugin(DataPlugin):
         is suppressed to keep payloads small.
         """
         if limit < 1:
-            raise ValueError(f"limit must be at least 1 (got {limit})")
+            raise ToolInputError(f"limit must be at least 1 (got {limit})")
 
         lon_f, lat_f = self._validate_lonlat(lon, lat)
 
@@ -1252,11 +1258,11 @@ class AnchorageGISPlugin(DataPlugin):
         item_type = item.get("type", "")
 
         if not service_url:
-            raise ValueError(
+            raise ToolInputError(
                 self._not_queryable_message(resource_id, item_type)
             )
         if item_type and item_type not in self.QUERYABLE_TYPES:
-            raise ValueError(
+            raise ToolInputError(
                 self._not_queryable_message(resource_id, item_type)
             )
 
@@ -1285,7 +1291,7 @@ class AnchorageGISPlugin(DataPlugin):
             "esriGeometryPolygon",
             "esriGeometryMultiPatch",
         ):
-            raise ValueError(
+            raise ToolInputError(
                 f"spatial_query_point requires a polygon layer "
                 f"(layer geometryType is {geom_type or 'unknown'!r})"
             )
@@ -1385,7 +1391,7 @@ class AnchorageGISPlugin(DataPlugin):
         key = (units or "meters").strip().lower()
         canonical = cls._LINEAR_UNIT_ALIASES.get(key)
         if canonical is None:
-            raise ValueError(
+            raise ToolInputError(
                 f"units {units!r} is not a supported linear unit. Use "
                 f"one of: meters, kilometers, feet, miles, yards."
             )
@@ -1425,7 +1431,7 @@ class AnchorageGISPlugin(DataPlugin):
         within half a mile of a park).
         """
         if limit < 1:
-            raise ValueError(f"limit must be at least 1 (got {limit})")
+            raise ToolInputError(f"limit must be at least 1 (got {limit})")
 
         buffer_distance: Optional[float] = None
         esri_units: Optional[str] = None
@@ -1433,11 +1439,11 @@ class AnchorageGISPlugin(DataPlugin):
             try:
                 buffer_distance = float(distance)
             except (TypeError, ValueError) as exc:
-                raise ValueError(
+                raise ToolInputError(
                     f"distance must be a number (got {distance!r})"
                 ) from exc
             if buffer_distance < 0:
-                raise ValueError(
+                raise ToolInputError(
                     f"distance must be >= 0 (got {buffer_distance})"
                 )
             if buffer_distance == 0:
@@ -1448,7 +1454,7 @@ class AnchorageGISPlugin(DataPlugin):
                 ]
 
         if not filter_geometry and not filter_item_id:
-            raise ValueError(
+            raise ToolInputError(
                 "spatial_query_polygon requires either filter_geometry "
                 "(inline GeoJSON) or filter_item_id + filter_where"
             )
@@ -1457,7 +1463,7 @@ class AnchorageGISPlugin(DataPlugin):
             (spatial_rel or "intersects").lower()
         )
         if not spatial_rel_esri:
-            raise ValueError(
+            raise ToolInputError(
                 f"spatial_rel must be one of "
                 f"{sorted(self._SPATIAL_REL_MAP)} (got {spatial_rel!r})"
             )
@@ -1473,11 +1479,11 @@ class AnchorageGISPlugin(DataPlugin):
         target_url = item.get("url", "")
         item_type = item.get("type", "")
         if not target_url:
-            raise ValueError(
+            raise ToolInputError(
                 self._not_queryable_message(resource_id, item_type)
             )
         if item_type and item_type not in self.QUERYABLE_TYPES:
-            raise ValueError(
+            raise ToolInputError(
                 self._not_queryable_message(resource_id, item_type)
             )
 
@@ -1577,7 +1583,7 @@ class AnchorageGISPlugin(DataPlugin):
     def _geojson_to_esri_polygon(geojson: Any) -> Dict[str, Any]:
         """Convert GeoJSON Polygon / MultiPolygon / Feature to Esri polygon JSON."""
         if not isinstance(geojson, dict):
-            raise ValueError(
+            raise ToolInputError(
                 f"filter_geometry must be a GeoJSON object "
                 f"(got {type(geojson).__name__})"
             )
@@ -1593,17 +1599,17 @@ class AnchorageGISPlugin(DataPlugin):
             for poly in geojson.get("coordinates") or []:
                 rings.extend(poly)
         else:
-            raise ValueError(
+            raise ToolInputError(
                 f"filter_geometry must be a GeoJSON Polygon, "
                 f"MultiPolygon, or Feature wrapping one "
                 f"(got type={gj_type!r})"
             )
         if not rings:
-            raise ValueError("filter_geometry has no polygon rings")
+            raise ToolInputError("filter_geometry has no polygon rings")
 
         ring_count = len(rings)
         if ring_count > AnchorageGISPlugin.MAX_FILTER_RINGS:
-            raise ValueError(
+            raise ToolInputError(
                 f"filter_geometry has {ring_count} rings; "
                 f"max is {AnchorageGISPlugin.MAX_FILTER_RINGS}. "
                 f"Simplify the polygon or use filter_item_id with a "
@@ -1611,7 +1617,7 @@ class AnchorageGISPlugin(DataPlugin):
             )
         coord_count = sum(len(r) for r in rings if isinstance(r, list))
         if coord_count > AnchorageGISPlugin.MAX_FILTER_COORDS:
-            raise ValueError(
+            raise ToolInputError(
                 f"filter_geometry has {coord_count} coordinates; "
                 f"max is {AnchorageGISPlugin.MAX_FILTER_COORDS}. "
                 f"Simplify the polygon (e.g. mapshaper at 1% tolerance) "
@@ -1639,7 +1645,7 @@ class AnchorageGISPlugin(DataPlugin):
         item = await self.get_dataset(filter_item_id)
         url = item.get("url", "")
         if not url:
-            raise ValueError(
+            raise ToolInputError(
                 f"filter_item_id {filter_item_id} has no service URL"
             )
         url = self._ensure_layer_url(url)
@@ -1657,7 +1663,7 @@ class AnchorageGISPlugin(DataPlugin):
             "esriGeometryPolygon",
             "esriGeometryMultiPatch",
         ):
-            raise ValueError(
+            raise ToolInputError(
                 f"filter_item_id must point at a polygon layer "
                 f"(got geometryType={geom_type or 'unknown'!r})"
             )
@@ -1681,7 +1687,7 @@ class AnchorageGISPlugin(DataPlugin):
 
         features = data.get("features", [])
         if not features:
-            raise ValueError(
+            raise ToolInputError(
                 f"filter_where {validated_where!r} matched no features "
                 f"in filter layer {filter_item_id}"
             )
@@ -1692,7 +1698,7 @@ class AnchorageGISPlugin(DataPlugin):
             all_rings.extend(geom.get("rings") or [])
 
         if not all_rings:
-            raise ValueError(
+            raise ToolInputError(
                 f"filter features in {filter_item_id} have no "
                 f"polygon rings"
             )
@@ -1708,13 +1714,13 @@ class AnchorageGISPlugin(DataPlugin):
         """Combined search: gallery + spatial layers."""
         topic = args.get("topic", "").strip()
         if not topic:
-            raise ValueError(
+            raise ToolInputError(
                 "topic is required -- pass the subject of the user's "
                 "question as a 1-2 word topic (e.g. 'parks', 'trails', "
                 "'flood', 'zoning'). Do not ask the user for clarification "
                 "if the topic is obvious from their message."
             )
-        limit = min(int(args.get("limit", 8)), 50)
+        limit = min(self._int_arg(args, "limit", 8), 50)
 
         gallery_results, layer_results = await asyncio.gather(
             self._search_gallery(topic, limit),
@@ -1904,7 +1910,7 @@ class AnchorageGISPlugin(DataPlugin):
         """Fetch schema for a Feature/Map Service layer."""
         item_id = args.get("item_id", "").strip()
         service_url = args.get("service_url", "").strip()
-        layer_index = int(args.get("layer_index", 0))
+        layer_index = self._int_arg(args, "layer_index", 0)
         keyword = args.get("keyword", "").strip().lower()
         item_title = service_url or item_id
 
@@ -2036,9 +2042,9 @@ class AnchorageGISPlugin(DataPlugin):
         """Find services containing a specific field name/alias."""
         field_keyword = args.get("field_keyword", "").strip().lower()
         if not field_keyword:
-            raise ValueError("field_keyword is required")
+            raise ToolInputError("field_keyword is required")
         service_keyword = args.get("service_keyword", "").strip()
-        limit = min(int(args.get("limit", 10)), 20)
+        limit = min(self._int_arg(args, "limit", 10), 20)
 
         type_filter = " OR ".join(f'type:"{t}"' for t in self.LAYER_TYPES)
         clauses = [
@@ -2199,15 +2205,15 @@ class AnchorageGISPlugin(DataPlugin):
         On-prem MOA hosts (``*.muni.org``) are accepted by suffix.
         """
         if not url:
-            raise ValueError("service URL cannot be empty")
+            raise ToolInputError("service URL cannot be empty")
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
-            raise ValueError(
+            raise ToolInputError(
                 f"service URL must use http or https (got {parsed.scheme!r})"
             )
         host = (parsed.hostname or "").lower()
         if not host:
-            raise ValueError("service URL must include a hostname")
+            raise ToolInputError("service URL must include a hostname")
 
         if any(
             host == suffix.lstrip(".") or host.endswith(suffix)
@@ -2222,13 +2228,13 @@ class AnchorageGISPlugin(DataPlugin):
             org_id = (self.plugin_config.org_id or "").lower() if self.plugin_config else ""
             if org_id and parsed.path.lower().startswith(f"/{org_id}/"):
                 return url
-            raise ValueError(
+            raise ToolInputError(
                 f"service URL host {host!r} (path {parsed.path!r}) is not "
                 f"scoped to org {org_id!r}; refusing to proxy other "
                 f"ArcGIS Online tenants"
             )
 
-        raise ValueError(
+        raise ToolInputError(
             f"service URL host {host!r} is not on the allowlist"
         )
 
@@ -2243,7 +2249,7 @@ class AnchorageGISPlugin(DataPlugin):
     def _validate_item_id(cls, item_id: str) -> str:
         """Require an ArcGIS item ID to be a 32-char hex string."""
         if not item_id or not cls.ITEM_ID_RE.match(item_id):
-            raise ValueError(
+            raise ToolInputError(
                 f"Invalid ArcGIS item id: {item_id!r} "
                 f"(expected 32-character hex string)"
             )
@@ -2322,15 +2328,15 @@ class AnchorageGISPlugin(DataPlugin):
             lon_f = float(lon)
             lat_f = float(lat)
         except (TypeError, ValueError) as e:
-            raise ValueError(
+            raise ToolInputError(
                 f"lon/lat must be numeric (got lon={lon!r}, lat={lat!r})"
             ) from e
         if not (-180.0 <= lon_f <= 180.0):
-            raise ValueError(
+            raise ToolInputError(
                 f"lon out of range [-180, 180]: {lon_f}"
             )
         if not (-90.0 <= lat_f <= 90.0):
-            raise ValueError(
+            raise ToolInputError(
                 f"lat out of range [-90, 90]: {lat_f}"
             )
         return lon_f, lat_f
@@ -3072,11 +3078,11 @@ class AnchorageGISPlugin(DataPlugin):
         url = item.get("url", "")
         item_type = item.get("type", "")
         if not url:
-            raise ValueError(
+            raise ToolInputError(
                 f"Item {item_id} has no queryable service URL"
             )
         if item_type and item_type not in self.QUERYABLE_TYPES:
-            raise ValueError(
+            raise ToolInputError(
                 f"Item type '{item_type}' is not queryable."
             )
         url = self._ensure_layer_url(url)
@@ -3126,13 +3132,13 @@ class AnchorageGISPlugin(DataPlugin):
             "esriGeometryPolygon",
             "esriGeometryMultiPatch",
         ):
-            raise ValueError(
+            raise ToolInputError(
                 f"aggregation_item_id must point at a polygon layer "
                 f"(got geometryType={geom_type or 'unknown'!r})"
             )
         field_names = {f.get("name") for f in meta.get("fields", [])}
         if group_by_field not in field_names:
-            raise ValueError(
+            raise ToolInputError(
                 f"group_by_field {group_by_field!r} is not a field on "
                 f"the aggregation layer. Available fields: "
                 f"{sorted(field_names)[:12]}..."
@@ -3333,7 +3339,7 @@ class AnchorageGISPlugin(DataPlugin):
         )
         group_by_field = (args.get("group_by_field") or "").strip()
         if not group_by_field:
-            raise ValueError("group_by_field is required")
+            raise ToolInputError("group_by_field is required")
         raw_sum_fields = args.get("sum_fields") or []
         if isinstance(raw_sum_fields, str):
             raw_sum_fields = [
@@ -3350,13 +3356,13 @@ class AnchorageGISPlugin(DataPlugin):
         agg_where = WhereValidator.validate(args.get("agg_where") or "1=1")
         centroid_mode = (args.get("centroid_mode") or "auto").lower()
         if centroid_mode not in ("auto", "centroid", "representative_point"):
-            raise ValueError(
+            raise ToolInputError(
                 "centroid_mode must be one of: auto, centroid, "
                 "representative_point"
             )
         overlap_policy = (args.get("overlap_policy") or "first_match").lower()
         if overlap_policy not in ("first_match", "all_matches", "largest"):
-            raise ValueError(
+            raise ToolInputError(
                 "overlap_policy must be one of: first_match, "
                 "all_matches, largest"
             )
@@ -3371,12 +3377,12 @@ class AnchorageGISPlugin(DataPlugin):
             try:
                 buffer_val = float(raw_buffer)
             except (TypeError, ValueError) as exc:
-                raise ValueError(
+                raise ToolInputError(
                     f"buffer_distance must be a number "
                     f"(got {raw_buffer!r})"
                 ) from exc
             if buffer_val < 0:
-                raise ValueError(
+                raise ToolInputError(
                     f"buffer_distance must be >= 0 (got {buffer_val})"
                 )
             if buffer_val > 0:
@@ -3388,7 +3394,7 @@ class AnchorageGISPlugin(DataPlugin):
                     * self._LINEAR_UNIT_TO_METERS[buffer_units_canonical]
                 )
         max_source = min(
-            int(args.get("max_source_features", self.AGG_SOURCE_LIMIT)),
+            self._int_arg(args, "max_source_features", self.AGG_SOURCE_LIMIT),
             self.AGG_SOURCE_LIMIT,
         )
 
@@ -3398,7 +3404,7 @@ class AnchorageGISPlugin(DataPlugin):
             aggregation_item_id, group_by_field, agg_where
         )
         if not agg_polygons:
-            raise ValueError(
+            raise ToolInputError(
                 f"agg_where {agg_where!r} matched no polygons on "
                 f"the aggregation layer"
             )
@@ -3421,12 +3427,12 @@ class AnchorageGISPlugin(DataPlugin):
         }
         for f in sum_fields:
             if f not in source_fields:
-                raise ValueError(
+                raise ToolInputError(
                     f"sum_fields entry {f!r} is not a field on the "
                     f"source layer"
                 )
             if f not in numeric_fields:
-                raise ValueError(
+                raise ToolInputError(
                     f"sum_fields entry {f!r} is not a numeric field "
                     f"(cannot be summed)"
                 )
@@ -3745,7 +3751,7 @@ class AnchorageGISPlugin(DataPlugin):
         )
         target_id_field = (args.get("target_id_field") or "").strip()
         if not target_id_field:
-            raise ValueError(
+            raise ToolInputError(
                 "target_id_field is required -- a field that labels each "
                 "target polygon (e.g. 'Parcel_ID')."
             )
@@ -3767,19 +3773,19 @@ class AnchorageGISPlugin(DataPlugin):
             try:
                 v = float(raw)
             except (TypeError, ValueError) as exc:
-                raise ValueError(f"{name} must be a number (got {raw!r})") from exc
+                raise ToolInputError(f"{name} must be a number (got {raw!r})") from exc
             if v < 0:
-                raise ValueError(f"{name} must be >= 0 (got {v})")
+                raise ToolInputError(f"{name} must be >= 0 (got {v})")
             return v
 
         max_cov = _opt_pct("max_coverage_pct")
         min_cov = _opt_pct("min_coverage_pct")
         if min_cov is not None and max_cov is not None and min_cov >= max_cov:
-            raise ValueError(
+            raise ToolInputError(
                 "min_coverage_pct must be less than max_coverage_pct"
             )
         max_targets = min(
-            int(args.get("max_targets", self.COVERAGE_TARGET_LIMIT)),
+            self._int_arg(args, "max_targets", self.COVERAGE_TARGET_LIMIT),
             self.COVERAGE_TARGET_LIMIT,
         )
 
@@ -3789,12 +3795,12 @@ class AnchorageGISPlugin(DataPlugin):
         overlay_meta = await self._fetch_layer_meta(overlay_url)
         poly_types = ("esriGeometryPolygon", "esriGeometryMultiPatch")
         if target_meta.get("geometryType") not in poly_types:
-            raise ValueError(
+            raise ToolInputError(
                 f"target_item_id must be a polygon layer (got "
                 f"geometryType={target_meta.get('geometryType')!r})"
             )
         if overlay_meta.get("geometryType") not in poly_types:
-            raise ValueError(
+            raise ToolInputError(
                 f"overlay_item_id must be a polygon layer (got "
                 f"geometryType={overlay_meta.get('geometryType')!r})"
             )
@@ -3806,7 +3812,7 @@ class AnchorageGISPlugin(DataPlugin):
             f.get("name"): f for f in overlay_meta.get("fields", [])
         }
         if target_id_field not in target_fields:
-            raise ValueError(
+            raise ToolInputError(
                 f"target_id_field {target_id_field!r} is not a field on the "
                 f"target layer. Available: {sorted(target_fields)[:12]}..."
             )
@@ -3815,14 +3821,14 @@ class AnchorageGISPlugin(DataPlugin):
             ("overlay_area_field", overlay_area_field, overlay_fields),
         ):
             if fld not in fields:
-                raise ValueError(
+                raise ToolInputError(
                     f"{label} {fld!r} is not a field on the layer. Most "
                     f"hosted layers expose 'Shape__Area'; otherwise pass an "
                     f"explicit numeric area field. Available: "
                     f"{sorted(fields)[:12]}..."
                 )
             if fields[fld].get("type") not in self._NUMERIC_FIELD_TYPES:
-                raise ValueError(
+                raise ToolInputError(
                     f"{label} {fld!r} is not numeric, so it can't be an area."
                 )
 
@@ -3833,7 +3839,7 @@ class AnchorageGISPlugin(DataPlugin):
             limit=max_targets,
         )
         if not targets:
-            raise ValueError(
+            raise ToolInputError(
                 f"target_where {target_where!r} matched no polygons on the "
                 f"target layer"
             )
@@ -4133,7 +4139,7 @@ class AnchorageGISPlugin(DataPlugin):
         )
         container_where = (args.get("container_where") or "").strip()
         if not container_where:
-            raise ValueError(
+            raise ToolInputError(
                 "container_where is required -- it identifies which "
                 "polygon(s) in the container layer to filter against"
             )
@@ -4145,7 +4151,7 @@ class AnchorageGISPlugin(DataPlugin):
         )
         out_fields = args.get("out_fields", "*")
         return_geometry = bool(args.get("return_geometry", False))
-        requested_limit = int(args.get("limit", 100))
+        requested_limit = self._int_arg(args, "limit", 100)
         effective_limit = (
             min(requested_limit, self.GEOMETRY_LIMIT_CAP)
             if return_geometry
@@ -4161,7 +4167,7 @@ class AnchorageGISPlugin(DataPlugin):
             "esriGeometryPolygon",
             "esriGeometryMultiPatch",
         ):
-            raise ValueError(
+            raise ToolInputError(
                 f"container_item_id must point at a polygon layer "
                 f"(got geometryType={geom_type or 'unknown'!r})"
             )
@@ -4291,16 +4297,16 @@ class AnchorageGISPlugin(DataPlugin):
         )
         field = (args.get("field") or "").strip()
         if not field:
-            raise ValueError("field is required")
+            raise ToolInputError("field is required")
         like = (args.get("like") or "").strip()
         where = (args.get("where") or "1=1").strip()
-        limit = min(int(args.get("limit", 50)), 500)
+        limit = min(self._int_arg(args, "limit", 50), 500)
 
         layer_url = await self._resolve_layer_url(item_id)
         meta = await self._fetch_layer_meta(layer_url)
         field_names = {f.get("name") for f in meta.get("fields", [])}
         if field not in field_names:
-            raise ValueError(
+            raise ToolInputError(
                 f"field {field!r} is not a field on this layer. "
                 f"Call `get_layer_schema(item_id='{item_id}')` to "
                 f"see valid names -- they are CASE-SENSITIVE. "
@@ -4453,20 +4459,20 @@ class AnchorageGISPlugin(DataPlugin):
         )
         parcel_field = (args.get("parcel_field") or "").strip()
         if not parcel_field:
-            raise ValueError("parcel_field is required")
+            raise ToolInputError("parcel_field is required")
         parcel_id = (args.get("parcel_id") or "").strip()
         if not parcel_id:
-            raise ValueError("parcel_id is required")
+            raise ToolInputError("parcel_id is required")
         out_fields = OutFieldsValidator.validate(
             args.get("out_fields") or "*"
         )
-        limit = min(int(args.get("limit", 10)), 100)
+        limit = min(self._int_arg(args, "limit", 10), 100)
 
         layer_url = await self._resolve_layer_url(item_id)
         meta = await self._fetch_layer_meta(layer_url)
         field_names = {f.get("name") for f in meta.get("fields", [])}
         if parcel_field not in field_names:
-            raise ValueError(
+            raise ToolInputError(
                 f"parcel_field {parcel_field!r} is not a field on "
                 f"this layer. Call `get_layer_schema(item_id="
                 f"'{item_id}', keyword='parcel')` to find the right "
@@ -4478,7 +4484,7 @@ class AnchorageGISPlugin(DataPlugin):
 
         variants = self._normalize_parcel_variants(parcel_id)
         if not variants:
-            raise ValueError(
+            raise ToolInputError(
                 f"Could not extract any digits from parcel_id "
                 f"{parcel_id!r}. Provide a parcel ID like "
                 f"'001-213-29', '00121329', or '00121329000'."
@@ -4834,10 +4840,10 @@ class AnchorageGISPlugin(DataPlugin):
         """
         parcel_id = (args.get("parcel_id") or "").strip()
         if not parcel_id:
-            raise ValueError("parcel_id is required")
+            raise ToolInputError("parcel_id is required")
         variants = self._normalize_parcel_variants(parcel_id)
         if not variants:
-            raise ValueError(
+            raise ToolInputError(
                 f"Could not extract any digits from parcel_id "
                 f"{parcel_id!r}. Provide a parcel ID like "
                 f"'001-213-29', '00121329', or '00121329000'."
@@ -4976,7 +4982,7 @@ class AnchorageGISPlugin(DataPlugin):
         geom = feat.get("geometry") or {}
         rings = geom.get("rings") or []
         if not rings:
-            raise ValueError(
+            raise ToolInputError(
                 f"Parcel {canonical_id} has no polygon geometry in "
                 f"the parcel layer, so buildings cannot be joined."
             )
@@ -5014,7 +5020,7 @@ class AnchorageGISPlugin(DataPlugin):
         # the count/detail only, where clip slivers are excluded).
         parcel_paths = self._esri_rings_to_clipper_paths(rings)
         if not parcel_paths:
-            raise ValueError(
+            raise ToolInputError(
                 f"Parcel {canonical_id} geometry has no usable rings."
             )
         all_paths: List[List[Tuple[int, int]]] = []
@@ -5257,11 +5263,11 @@ class AnchorageGISPlugin(DataPlugin):
             args.get("classification_field") or ""
         ).strip()
         if not classification_field:
-            raise ValueError("classification_field is required")
+            raise ToolInputError("classification_field is required")
 
         # Enforce min_distinct >= 2 -- anything less is "any feature
         # touching a classification", which is just spatial_query_polygon.
-        min_distinct = max(2, int(args.get("min_distinct", 2)))
+        min_distinct = max(2, self._int_arg(args, "min_distinct", 2))
         source_where = WhereValidator.validate(
             args.get("source_where") or "1=1"
         )
@@ -5271,12 +5277,10 @@ class AnchorageGISPlugin(DataPlugin):
         out_fields = OutFieldsValidator.validate(
             args.get("out_fields") or "*"
         )
-        limit = min(int(args.get("limit", 100)), 1000)
+        limit = min(self._int_arg(args, "limit", 100), 1000)
         max_source = min(
-            int(
-                args.get(
-                    "max_source_features", self.SPANNING_SOURCE_LIMIT
-                )
+            self._int_arg(
+                args, "max_source_features", self.SPANNING_SOURCE_LIMIT
             ),
             self.SPANNING_SOURCE_LIMIT,
         )
@@ -5287,7 +5291,7 @@ class AnchorageGISPlugin(DataPlugin):
         # layer for both args when reasoning is muddled; refuse fast
         # so we don't waste a spatial loop and confuse the user.
         if source_item_id == classification_item_id:
-            raise ValueError(
+            raise ToolInputError(
                 "source_item_id and classification_item_id are the "
                 "same layer. Self-intersection is meaningless -- "
                 "every feature trivially touches itself. For a "
@@ -5310,7 +5314,7 @@ class AnchorageGISPlugin(DataPlugin):
             "esriGeometryPolygon",
             "esriGeometryMultiPatch",
         ):
-            raise ValueError(
+            raise ToolInputError(
                 f"classification_item_id must point at a polygon "
                 f"layer (got geometryType={cls_geom or 'unknown'!r}). "
                 f"Spanning analysis needs polygons to define the "
@@ -5320,7 +5324,7 @@ class AnchorageGISPlugin(DataPlugin):
             f.get("name") for f in cls_meta.get("fields", [])
         }
         if classification_field not in cls_field_names:
-            raise ValueError(
+            raise ToolInputError(
                 f"classification_field {classification_field!r} is "
                 f"not a field on the classification layer. Call "
                 f"`get_layer_schema(item_id="
@@ -5352,7 +5356,7 @@ class AnchorageGISPlugin(DataPlugin):
             parcel_fields_present = sorted(
                 self.PARCEL_INDICATOR_FIELDS & cls_field_names
             )
-            raise ValueError(
+            raise ToolInputError(
                 f"classification_item_id `{classification_item_id}` "
                 f"looks like a per-parcel layer -- it has parcel "
                 f"identifier field(s) "
@@ -5401,7 +5405,7 @@ class AnchorageGISPlugin(DataPlugin):
                     and not f.startswith("Shape__")
                     and f not in ("OBJECTID", "OID", "FID")
                 ][:12]
-                raise ValueError(
+                raise ToolInputError(
                     f"source_item_id `{source_item_id}` has no "
                     f"user-facing identifier field (no Parcel_ID, "
                     f"Name, Address, Title, etc.). Without one, "
@@ -5434,7 +5438,7 @@ class AnchorageGISPlugin(DataPlugin):
         if source_count is None:
             source_count = 0
         if source_count > max_source:
-            raise ValueError(
+            raise ToolInputError(
                 f"source layer has {source_count:,} features matching "
                 f"source_where, exceeding the cap of "
                 f"{max_source:,}. Narrow `source_where` to fit under "
@@ -5482,7 +5486,7 @@ class AnchorageGISPlugin(DataPlugin):
             limit=self.SPANNING_CLASSIFICATION_LIMIT,
         )
         if not cls_polys:
-            raise ValueError(
+            raise ToolInputError(
                 f"classification_where ({classification_where!r}) "
                 f"matched no polygons in the classification layer. "
                 f"Verify with `query_data(item_id="
@@ -5507,7 +5511,7 @@ class AnchorageGISPlugin(DataPlugin):
                 continue
             valid_cls.append((val, geom))
         if not valid_cls:
-            raise ValueError(
+            raise ToolInputError(
                 f"all classification polygons matching "
                 f"classification_where have NULL "
                 f"`{classification_field}` values or missing "
@@ -6060,6 +6064,35 @@ class AnchorageGISPlugin(DataPlugin):
             "rows": rows,
             "caveats": span_caveats,
         }
+
+    @staticmethod
+    def _int_arg(args: Dict[str, Any], name: str, default: Any = None) -> int:
+        """Coerce a caller-supplied argument to int, or explain why not.
+
+        A bare int() raises "invalid literal for int() with base 10:
+        'abc'" -- which reads as a server fault in the logs and tells the
+        caller nothing about which argument was wrong.
+        """
+        raw = args.get(name, default)
+        try:
+            return int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ToolInputError(
+                f"{name} must be an integer (got {raw!r})"
+            ) from exc
+
+    @staticmethod
+    def _float_arg(
+        args: Dict[str, Any], name: str, default: Any = None
+    ) -> float:
+        """Coerce a caller-supplied argument to float, or explain why not."""
+        raw = args.get(name, default)
+        try:
+            return float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ToolInputError(
+                f"{name} must be a number (got {raw!r})"
+            ) from exc
 
     # ── Tool definitions ──────────────────────────────────────────────────
 
@@ -7836,7 +7869,7 @@ class AnchorageGISPlugin(DataPlugin):
             elif tool_name == "browse_gallery":
                 text = await self._browse_gallery(
                     arguments.get("keyword", "").strip(),
-                    min(int(arguments.get("limit", 20)), 100),
+                    min(self._int_arg(arguments, "limit", 20), 100),
                 )
 
             elif tool_name == "search_spatial_layers":
@@ -7850,7 +7883,7 @@ class AnchorageGISPlugin(DataPlugin):
                 text = await self._search_spatial_layers(
                     query,
                     arguments.get("layer_type", "all"),
-                    min(int(arguments.get("limit", 10)), 50),
+                    min(self._int_arg(arguments, "limit", 10), 50),
                 )
 
             elif tool_name == "get_item_details":
@@ -7891,7 +7924,7 @@ class AnchorageGISPlugin(DataPlugin):
                 return_geometry = bool(
                     arguments.get("return_geometry", False)
                 )
-                requested_limit = int(arguments.get("limit", 25))
+                requested_limit = self._int_arg(arguments, "limit", 25)
                 effective_limit = (
                     min(requested_limit, self.GEOMETRY_LIMIT_CAP)
                     if return_geometry
@@ -7989,7 +8022,7 @@ class AnchorageGISPlugin(DataPlugin):
                         success=False,
                         error_message="lon and lat are required",
                     )
-                limit = min(int(arguments.get("limit", 10)), 50)
+                limit = min(self._int_arg(arguments, "limit", 10), 50)
                 records, layer_meta = await asyncio.gather(
                     self.spatial_query_point(
                         item_id,
@@ -8059,7 +8092,7 @@ class AnchorageGISPlugin(DataPlugin):
                 return_geometry = bool(
                     arguments.get("return_geometry", False)
                 )
-                requested_limit = int(arguments.get("limit", 25))
+                requested_limit = self._int_arg(arguments, "limit", 25)
                 effective_limit = (
                     min(requested_limit, self.GEOMETRY_LIMIT_CAP)
                     if return_geometry
@@ -8152,6 +8185,21 @@ class AnchorageGISPlugin(DataPlugin):
                 ],
                 success=True,
                 structured_content=structured,
+            )
+
+        except ToolInputError as e:
+            # The caller asked for something invalid. That is not a
+            # server fault, so no traceback -- a stack trace here is a
+            # false claim that this server broke, and it buries the
+            # real ones. The message still reaches the caller verbatim.
+            logger.warning(
+                f"Invalid arguments for tool {tool_name}: {e}",
+                extra={"tool_name": tool_name, "error_type": type(e).__name__},
+            )
+            return ToolResult(
+                content=[],
+                success=False,
+                error_message=str(e) if str(e) else "Invalid tool arguments",
             )
 
         except Exception as e:

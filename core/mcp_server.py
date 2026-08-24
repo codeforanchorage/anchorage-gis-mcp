@@ -341,10 +341,12 @@ class MCPServer:
         try:
             request = json.loads(body)
         except json.JSONDecodeError as e:
-            logger.error(
+            # A malformed body is the caller's mistake. -32700 already
+            # tells them exactly that; our own parse traceback adds
+            # nothing and reads as a server fault.
+            logger.warning(
                 f"Invalid JSON in request body: {e}",
                 extra={"error_type": "JSONDecodeError"},
-                exc_info=True,
             )
             return {
                 "statusCode": 400,

@@ -20,6 +20,30 @@ class PluginType(str, Enum):
     ANALYTICS = "analytics"
 
 
+class ToolInputError(ValueError):
+    """Raised when a tool rejects the caller's arguments.
+
+    A marker, not a behaviour change: it exists so the outer handler can
+    tell "the caller asked for something invalid" from "this server
+    broke", and log the first at WARNING with no traceback. A traceback
+    is a claim that the server failed; spending one on "you forgot
+    item_id" is what makes real faults hard to find.
+
+    Deliberately NOT inferred from ValueError alone. That heuristic is
+    wrong in two ways here:
+      * json.JSONDecodeError subclasses ValueError, so a malformed
+        upstream payload would be misfiled as a caller mistake and lose
+        its stack trace.
+      * The ArcGIS wrapper raises plain ValueError for "Feature Service
+        returned non-JSON" -- a genuine upstream fault whose traceback
+        we want.
+    Both stay plain ValueError and keep their tracebacks.
+
+    Subclasses ValueError so every existing `except ValueError` keeps
+    working, which makes converting a raise site mechanical and safe.
+    """
+
+
 class InvalidToolParamsError(ValueError):
     """Raised when a tools/call request is itself malformed.
 
