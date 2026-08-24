@@ -253,7 +253,18 @@ try:
     })
     sc = r.get("result", {}).get("structuredContent") or {}
     summ = sc.get("summary", {})
-    ok = summ.get("buckets") == 3 and summ.get("unmatched") == 0
+    # The regression was that a POLYLINE source failed outright. Assert
+    # the invariants that prove it works -- every source feature bucketed,
+    # at least one bucket -- rather than an exact bucket count. Bucket
+    # count depends entirely on how source_where narrows the query, so
+    # pinning it would make this test a scope assertion, not a
+    # capability one.
+    ok = (
+        not r.get("result", {}).get("isError")
+        and summ.get("unmatched") == 0
+        and (summ.get("buckets") or 0) >= 1
+        and (summ.get("source_features") or 0) > 0
+    )
     check("regression: polyline source aggregation", ok,
           f"buckets={summ.get('buckets')} unmatched={summ.get('unmatched')} "
           f"source={summ.get('source_features')}")
