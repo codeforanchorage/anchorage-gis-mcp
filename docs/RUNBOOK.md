@@ -62,9 +62,8 @@ answering `yes` at the script's own confirm gate:
 > The value in `prod.tfvars` applies only on a rollback to a dedicated
 > ACL.
 >
-> **Known gap as of 2026-08-23:** the fleet value is still **600** while
-> this repo reads 300, so the live per-IP limit remains at the raised
-> setting until mcp-stats is updated.
+> The fleet value was lowered to 300 in mcp-stats on 2026-08-23, so the
+> live per-IP limit now matches the 300 shown above.
 
 Worst-case cost at full 24/7 saturation: steady ≈ $17/day, UC posture
 ≈ $50/day. Realistic traffic is far below both (conversational MCP is
