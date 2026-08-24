@@ -20,6 +20,19 @@ class PluginType(str, Enum):
     ANALYTICS = "analytics"
 
 
+class InvalidToolParamsError(ValueError):
+    """Raised when a tools/call request is itself malformed.
+
+    Covers the cases the MCP tools spec calls "requests that fail to
+    satisfy the CallToolRequest schema" -- a missing tool name, or
+    `arguments` that is not an object. Mapped to JSON-RPC -32602
+    ("Invalid params"): the request never described a valid call, so it
+    is neither a server fault (-32603) nor a tool execution error.
+
+    Subclasses ValueError for the same reason UnknownToolError does.
+    """
+
+
 class UnknownToolError(ValueError):
     """Raised when tools/call names a tool this server does not expose.
 
