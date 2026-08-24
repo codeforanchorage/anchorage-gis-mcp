@@ -325,6 +325,47 @@ class TestToolRegistration:
             assert all_tools[0]["name"] == "ckan__search_datasets"
             assert all_tools[0]["description"] == "Search datasets"
             assert all_tools[0]["inputSchema"] == {"type": "object"}
+            # A tool that sets no title must not emit an empty/null one --
+            # clients fall back to annotations.title then name.
+            assert "title" not in all_tools[0]
+
+    @pytest.mark.asyncio
+    async def test_get_all_tools_emits_title_at_top_level(self):
+        """`title` is a top-level Tool field in the MCP schema, not an
+        annotation, and must survive the prefixing done here."""
+        config = {
+            "plugins": {
+                "ckan": {"enabled": True, "base_url": "https://data.example.com"}
+            }
+        }
+        manager = PluginManager(config)
+
+        with patch("core.plugin_manager.PluginManager._load_plugin_class") as mock_load:
+            mock_plugin_class = MagicMock()
+            mock_instance = Mock()
+            mock_instance.initialize = AsyncMock(return_value=True)
+            mock_instance.get_tools = Mock(
+                return_value=[
+                    ToolDefinition(
+                        name="search_datasets",
+                        title="Search Datasets",
+                        description="Search datasets",
+                        input_schema={"type": "object"},
+                    ),
+                ]
+            )
+            mock_instance.plugin_name = "ckan"
+            mock_instance.plugin_type = PluginType.OPEN_DATA
+            mock_instance.plugin_version = "1.0.0"
+            mock_plugin_class.return_value = mock_instance
+            mock_load.return_value = mock_plugin_class
+
+            await manager.load_plugins()
+
+            all_tools = manager.get_all_tools()
+            assert all_tools[0]["title"] == "Search Datasets"
+            # The prefixed identifier is unchanged by the display name.
+            assert all_tools[0]["name"] == "ckan__search_datasets"
 
 
 class TestToolExecution:
