@@ -351,8 +351,57 @@ class TestToolsCall:
 
         assert response is not None
         assert "error" in response
-        assert response["error"]["code"] == -32603
-        assert "Tool name is required" in response["error"]["data"]
+        # A tools/call with no `name` never described a valid call, so
+        # it is Invalid params -- not a server fault.
+        assert response["error"]["code"] == -32602
+        assert response["error"]["message"] == "Invalid params"
+        assert "name" in response["error"]["data"]
+
+    @pytest.mark.asyncio
+    async def test_tools_call_rejects_non_object_arguments(self):
+        """`arguments` must be an object per the CallToolRequest schema.
+
+        Without this check a string or list reached the plugin and came
+        back as a raw Python AttributeError ("'str' object has no
+        attribute 'get'") presented to the caller as a tool result.
+        """
+        plugin_manager = MagicMock(spec=PluginManager)
+        server = MCPServer(plugin_manager)
+
+        for bad in ("oops", [1, 2], 5):
+            response = await server.handle_request({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "ckan__search", "arguments": bad},
+            })
+            assert response["error"]["code"] == -32602, bad
+            assert "arguments" in response["error"]["data"], bad
+            assert type(bad).__name__ in response["error"]["data"], bad
+
+        # A plugin must never be reached with a malformed request.
+        plugin_manager.execute_tool.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_tools_call_allows_omitted_arguments(self):
+        """`arguments` is optional; omitting it means an empty object."""
+        plugin_manager = MagicMock(spec=PluginManager)
+        plugin_manager.execute_tool = AsyncMock(
+            return_value=ToolResult(
+                content=[{"type": "text", "text": "ok"}], success=True
+            )
+        )
+        server = MCPServer(plugin_manager)
+
+        response = await server.handle_request({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "ckan__search"},
+        })
+
+        assert "error" not in response
+        plugin_manager.execute_tool.assert_awaited_once_with("ckan__search", {})
 
     @pytest.mark.asyncio
     async def test_tools_call_handles_missing_arguments(self):
