@@ -5332,6 +5332,33 @@ class AnchorageGISPlugin(DataPlugin):
 
     # ── Tool definitions ──────────────────────────────────────────────────
 
+    # Human-readable display names. The wire `name` is prefixed
+    # (`anchorage_gis__spatial_query_polygon`) because it must be a stable,
+    # collision-free identifier; that string reads poorly in a client's tool
+    # picker. Clients resolve display names as title -> annotations.title ->
+    # name, so these are what a user actually sees. Keyed by the UNPREFIXED
+    # tool name, matching the ToolDefinition entries below.
+    TOOL_TITLES = {
+        "find_gis_content": "Find GIS Content",
+        "browse_gallery": "Browse Map Gallery",
+        "search_spatial_layers": "Search Spatial Layers",
+        "get_item_details": "Get Item Details",
+        "get_layer_schema": "Get Layer Schema",
+        "get_distinct_values": "List Distinct Field Values",
+        "find_parcel": "Find Parcel",
+        "search_layers_by_field": "Search Layers by Field",
+        "query_data": "Query Layer Data",
+        "spatial_query_point": "Query by Point",
+        "spatial_query_polygon": "Query by Area or Buffer",
+        "aggregate_by_polygon": "Aggregate by Area",
+        "coverage_by_polygon": "Coverage by Area",
+        "filter_by_polygon": "Filter by Area",
+        "find_features_spanning_classifications": (
+            "Find Features Spanning Classifications"
+        ),
+        "footprint_for_parcel": "Lot Coverage for Parcel",
+    }
+
     def get_tools(self) -> List[ToolDefinition]:
         city = (
             self.plugin_config.city_name if self.plugin_config else "Unknown"
@@ -6513,9 +6540,15 @@ class AnchorageGISPlugin(DataPlugin):
         # ArcGIS services, so advertise the MCP safety hints uniformly. This
         # lets clients (e.g. M365 Copilot) treat them as safe and skip
         # per-call confirmation prompts.
+        #
+        # Deliberately NOT set: `idempotentHint`. The MCP schema documents it
+        # as "meaningful only when readOnlyHint == false", so on a read-only
+        # tool it would carry no information.
         for tool in tools:
             if tool.annotations is None:
                 tool.annotations = {"readOnlyHint": True, "openWorldHint": True}
+            if tool.title is None:
+                tool.title = self.TOOL_TITLES.get(tool.name)
         return tools
 
     # ── Tool dispatch ─────────────────────────────────────────────────────

@@ -109,7 +109,15 @@ aws:
   # Sized for aggregate_by_polygon, which holds up to 5000 source
   # features plus a bounded 32-entry polygon cache in memory.
   lambda_memory: 1024
-  lambda_timeout: 120
+  # MUST stay under the API Gateway integration timeout (29s, a hard REST
+  # limit that is not adjustable). Above it the gateway returns 504 while the
+  # Lambda keeps running -- billing compute the client already gave up on and,
+  # worse, holding one of only 10 reserved-concurrency slots for the
+  # remainder. 28s guarantees the Lambda self-terminates first, so the
+  # timeout is attributed in Lambda's own metrics and the slot frees at once.
+  # NOTE: this value takes precedence over `lambda_timeout` in prod.tfvars
+  # (see terraform/aws/main.tf locals) -- change it HERE.
+  lambda_timeout: 28
 
 logging:
   level: "INFO"
