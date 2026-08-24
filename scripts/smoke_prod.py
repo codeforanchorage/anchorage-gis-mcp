@@ -50,9 +50,11 @@ def check(label, ok, detail=""):
 
 
 # 1. ping
+# The spec defines the ping result as an empty object -- the liveness signal
+# is the successful response itself, not its body.
 try:
     r = rpc("ping")
-    check("ping", r.get("result", {}).get("status") == "ok", str(r.get("result")))
+    check("ping", r.get("result") == {} and "error" not in r, str(r.get("result")))
 except Exception as e:
     check("ping", False, repr(e))
 
