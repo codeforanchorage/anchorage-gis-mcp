@@ -73,6 +73,29 @@ class TestInitialize:
         assert result["instructions"] == "Start with find_gis_content."
 
     @pytest.mark.asyncio
+    async def test_initialize_negotiates_2025_11_25(self):
+        """The 2025-11-25 revision is supported and echoed back."""
+        plugin_manager = MagicMock(spec=PluginManager)
+        plugin_manager.config = {}
+        server = MCPServer(plugin_manager)
+
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-11-25"},
+        }
+
+        response = await server.handle_request(request)
+
+        assert response["result"]["protocolVersion"] == "2025-11-25"
+
+    @pytest.mark.asyncio
+    async def test_initialize_does_not_claim_2026_07_28(self):
+        """2026-07-28 drops the handshake entirely -- we must not claim it."""
+        assert "2026-07-28" not in MCPServer.SUPPORTED_PROTOCOL_VERSIONS
+
+    @pytest.mark.asyncio
     async def test_initialize_unsupported_version_falls_back(self):
         """An unrecognized requested version falls back to the default."""
         plugin_manager = MagicMock(spec=PluginManager)
@@ -384,7 +407,8 @@ class TestPing:
         assert response is not None
         assert response["jsonrpc"] == "2.0"
         assert response["id"] == 1
-        assert response["result"]["status"] == "ok"
+        # The spec defines the ping result as an empty object.
+        assert response["result"] == {}
 
 
 class TestNotifications:
@@ -445,7 +469,9 @@ class TestUnknownMethods:
 
         assert response is not None
         assert "error" in response
-        assert response["error"]["code"] == -32603
+        # An unknown method is a caller error, not a server fault.
+        assert response["error"]["code"] == -32601
+        assert response["error"]["message"] == "Method not found"
         assert "Unknown method" in response["error"]["data"]
 
 
