@@ -231,7 +231,7 @@ class TestCORS:
             )
             assert (
                 headers["Access-Control-Allow-Headers"]
-                == "content-type, accept, mcp-session-id"
+                == "content-type, accept, mcp-session-id, mcp-protocol-version"
             )
 
     def test_handle_options_returns_cors_headers(self):
@@ -250,7 +250,7 @@ class TestCORS:
         )
         assert (
             headers["Access-Control-Allow-Headers"]
-            == "content-type, accept, mcp-session-id"
+            == "content-type, accept, mcp-session-id, mcp-protocol-version"
         )
         assert headers["Access-Control-Max-Age"] == "86400"
         assert body == ""
@@ -272,18 +272,171 @@ class TestCORS:
             == "https://console.anthropic.com"
         )
 
-    def test_handle_options_falls_back_for_unknown_origin(self):
-        """Unknown origins do NOT get reflected — default origin is used."""
+    def test_handle_options_rejects_unknown_origin(self):
+        """A preflight from a non-allowlisted origin is refused with 403."""
         handler = UniversalHTTPHandler()
 
-        _status, headers, _body = handler.handle_options(
+        status, headers, _body = handler.handle_options(
             request_origin="https://attacker.example.com"
         )
-        assert headers["Access-Control-Allow-Origin"] == "https://claude.ai"
+        assert status == 403
         assert (
             "attacker.example.com"
             not in headers["Access-Control-Allow-Origin"]
         )
+
+
+class TestOriginValidation:
+    """Origin is rejected with 403, not silently defaulted."""
+
+    @pytest.mark.asyncio
+    async def test_disallowed_origin_returns_403(self):
+        """A POST carrying a non-allowlisted Origin is refused."""
+        handler = UniversalHTTPHandler()
+
+        status, headers, body = await handler.handle_request(
+            method="POST",
+            path="/mcp",
+            body=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+            headers={"origin": "https://attacker.example.com"},
+        )
+
+        assert status == 403
+        error_body = json.loads(body)
+        assert error_body["error"]["message"] == "Forbidden"
+        assert (
+            "attacker.example.com"
+            not in headers["Access-Control-Allow-Origin"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_origin_is_allowed(self):
+        """Native clients send no Origin at all and must not be blocked."""
+        handler = UniversalHTTPHandler()
+
+        with (
+            patch("server.http_handler._initialize_server"),
+            patch("server.http_handler._mcp_server") as mock_mcp_server,
+        ):
+            mock_mcp_server.handle_http_request = AsyncMock(
+                return_value={
+                    "statusCode": 200,
+                    "headers": {},
+                    "body": json.dumps({"result": {}}),
+                }
+            )
+
+            status, _headers, _body = await handler.handle_request(
+                method="POST",
+                path="/mcp",
+                body=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+                headers={},
+            )
+
+        assert status == 200
+
+    @pytest.mark.asyncio
+    async def test_allowlisted_origin_is_allowed(self):
+        """An allowlisted browser origin passes through and is reflected."""
+        handler = UniversalHTTPHandler()
+
+        with (
+            patch("server.http_handler._initialize_server"),
+            patch("server.http_handler._mcp_server") as mock_mcp_server,
+        ):
+            mock_mcp_server.handle_http_request = AsyncMock(
+                return_value={
+                    "statusCode": 200,
+                    "headers": {},
+                    "body": json.dumps({"result": {}}),
+                }
+            )
+
+            status, headers, _body = await handler.handle_request(
+                method="POST",
+                path="/mcp",
+                body=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+                headers={"origin": "https://claude.ai"},
+            )
+
+        assert status == 200
+        assert headers["Access-Control-Allow-Origin"] == "https://claude.ai"
+
+
+class TestProtocolVersionHeader:
+    """MCP-Protocol-Version header validation."""
+
+    @pytest.mark.asyncio
+    async def test_unsupported_version_returns_400(self):
+        """A declared revision we don't implement is refused with 400."""
+        handler = UniversalHTTPHandler()
+
+        status, _headers, body = await handler.handle_request(
+            method="POST",
+            path="/mcp",
+            body=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+            headers={"mcp-protocol-version": "2026-07-28"},
+        )
+
+        assert status == 400
+        error_body = json.loads(body)
+        # Deliberately NOT -32022: a plain 400 is what makes a dual-era
+        # client fall back to the initialize handshake.
+        assert error_body["error"]["code"] == -32600
+        assert error_body["error"]["data"]["requested"] == "2026-07-28"
+        assert "2025-11-25" in error_body["error"]["data"]["supported"]
+
+    @pytest.mark.asyncio
+    async def test_supported_version_passes_through(self):
+        """A supported declared revision is served normally."""
+        handler = UniversalHTTPHandler()
+
+        with (
+            patch("server.http_handler._initialize_server"),
+            patch("server.http_handler._mcp_server") as mock_mcp_server,
+        ):
+            mock_mcp_server.handle_http_request = AsyncMock(
+                return_value={
+                    "statusCode": 200,
+                    "headers": {},
+                    "body": json.dumps({"result": {}}),
+                }
+            )
+
+            status, _headers, _body = await handler.handle_request(
+                method="POST",
+                path="/mcp",
+                body=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+                headers={"mcp-protocol-version": "2025-11-25"},
+            )
+
+        assert status == 200
+
+    @pytest.mark.asyncio
+    async def test_absent_version_passes_through(self):
+        """No header means an older client; the spec says assume a default."""
+        handler = UniversalHTTPHandler()
+
+        with (
+            patch("server.http_handler._initialize_server"),
+            patch("server.http_handler._mcp_server") as mock_mcp_server,
+        ):
+            mock_mcp_server.handle_http_request = AsyncMock(
+                return_value={
+                    "statusCode": 200,
+                    "headers": {},
+                    "body": json.dumps({"result": {}}),
+                }
+            )
+
+            status, _headers, _body = await handler.handle_request(
+                method="POST",
+                path="/mcp",
+                body=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}),
+                headers={},
+            )
+
+        assert status == 200
 
 
 class TestSessionID:

@@ -1,5 +1,6 @@
 ---
 server_name: "Anchorage GIS MCP"
+server_version: "1.1.0"
 description: "Municipality of Anchorage GIS MCP server - Safe, conversational access to Anchorage GIS maps, apps, and spatial data"
 organization: "Municipality of Anchorage"
 
