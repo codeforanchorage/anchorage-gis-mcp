@@ -8,9 +8,9 @@ import pytest
 import json
 from unittest.mock import AsyncMock, MagicMock
 
+from core.interfaces import ToolResult, UnknownToolError
 from core.mcp_server import MCPServer
 from core.plugin_manager import PluginManager
-from core.interfaces import ToolResult
 
 
 class TestInitialize:
@@ -473,6 +473,55 @@ class TestUnknownMethods:
         assert response["error"]["code"] == -32601
         assert response["error"]["message"] == "Method not found"
         assert "Unknown method" in response["error"]["data"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_tool_returns_invalid_params_not_internal_error(self):
+        """An unknown TOOL is a caller error, like an unknown method.
+
+        Before this, naming a missing tool raised a bare ValueError that
+        fell through to the generic handler and came back as -32603
+        "Internal error" with a full traceback in the logs -- which reads
+        as a server fault and tells the model nothing it can act on. The
+        tools spec's own example is
+        {"code": -32602, "message": "Unknown tool: <name>"}.
+        """
+        plugin_manager = MagicMock(spec=PluginManager)
+        plugin_manager.execute_tool = AsyncMock(
+            side_effect=UnknownToolError("ckan__nope", "ckan__search")
+        )
+        server = MCPServer(plugin_manager)
+
+        response = await server.handle_request({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "ckan__nope", "arguments": {}},
+        })
+
+        assert response is not None
+        assert response["error"]["code"] == -32602
+        assert response["error"]["message"] == "Unknown tool: ckan__nope"
+        # The available-tool list rides in `data` so a model can recover.
+        assert "ckan__search" in response["error"]["data"]
+
+    @pytest.mark.asyncio
+    async def test_genuine_server_fault_stays_internal_error(self):
+        """The caller-error mapping must not swallow real failures."""
+        plugin_manager = MagicMock(spec=PluginManager)
+        plugin_manager.execute_tool = AsyncMock(
+            side_effect=RuntimeError("upstream exploded")
+        )
+        server = MCPServer(plugin_manager)
+
+        response = await server.handle_request({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "ckan__search", "arguments": {}},
+        })
+
+        assert response["error"]["code"] == -32603
+        assert response["error"]["message"] == "Internal error"
 
 
 class TestErrorHandling:
