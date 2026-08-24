@@ -190,6 +190,99 @@ try:
     check("error handling (bad field -> recovery hint)", ok, t[:90])
 except Exception as e:
     check("error handling (bad field -> recovery hint)", False, repr(e))
+# -- regression checks for previously-broken behaviours ----------------
+# Each of these was a live bug that is now fixed. They assert on stable
+# aggregates (bucket counts, record counts) rather than OBJECTIDs:
+# Streets_Hosted was republished in April and its OBJECTIDs shifted by
+# ~236k, so a test pinned to them would have rotted silently.
+
+PARK_FACILITIES = "98d46bfe15a046b99645b6d6b32f5d59"   # POINT layer
+COMMUNITY_COUNCIL = "934783d347ee4df5a0c12bd2d0339045"
+STREETS = "9072014f74064419b0641bfc701f0ebd"           # POLYLINE layer
+ASSEMBLY = "8e4f3735298f45fd9d31b99bddae4563"
+PROPERTY_INFO = "57d6ff611f444d75a1bf2b4a1d340163"
+
+# 14. spatial_query_polygon against a POINT target via filter_item_id
+try:
+    r = call_tool("spatial_query_polygon", {
+        "item_id": PARK_FACILITIES,
+        "filter_item_id": COMMUNITY_COUNCIL,
+        "filter_where": "COUNCIL='Downtown'",
+        "limit": 5,
+    })
+    t = text_of(r)
+    ok = not r.get("result", {}).get("isError") and "No features" not in t
+    check("regression: point-layer target via filter_item_id", ok, t[:80])
+except Exception as e:
+    check("regression: point-layer target via filter_item_id", False, repr(e))
+
+# 15. the same, via inline filter_geometry (a separate code path)
+try:
+    r = call_tool("spatial_query_polygon", {
+        "item_id": PARK_FACILITIES,
+        "filter_geometry": {
+            "type": "Polygon",
+            "coordinates": [[[-149.92, 61.20], [-149.92, 61.23],
+                             [-149.85, 61.23], [-149.85, 61.20],
+                             [-149.92, 61.20]]],
+        },
+        "limit": 5,
+    })
+    t = text_of(r)
+    ok = not r.get("result", {}).get("isError") and "No features" not in t
+    check("regression: point-layer target via inline geometry", ok, t[:80])
+except Exception as e:
+    check("regression: point-layer target via inline geometry", False, repr(e))
+
+# 16. search_layers_by_field with no service_keyword
+try:
+    r = call_tool("search_layers_by_field", {"field_keyword": "COUNCIL"})
+    t = text_of(r)
+    check("regression: search_layers_by_field without service_keyword",
+          "CommunityCouncil" in t, t[:80])
+except Exception as e:
+    check("regression: search_layers_by_field without service_keyword",
+          False, repr(e))
+
+# 17. aggregate_by_polygon with a POLYLINE source
+try:
+    r = call_tool("aggregate_by_polygon", {
+        "source_item_id": STREETS,
+        "aggregation_item_id": ASSEMBLY,
+        "group_by_field": "ASSEMBLY_SECTION",
+    })
+    sc = r.get("result", {}).get("structuredContent") or {}
+    summ = sc.get("summary", {})
+    ok = summ.get("buckets") == 3 and summ.get("unmatched") == 0
+    check("regression: polyline source aggregation", ok,
+          f"buckets={summ.get('buckets')} unmatched={summ.get('unmatched')} "
+          f"source={summ.get('source_features')}")
+except Exception as e:
+    check("regression: polyline source aggregation", False, repr(e))
+
+# 18. UNION inside a string literal must not trip the WHERE sanitizer
+try:
+    r = call_tool("query_data", {
+        "item_id": PROPERTY_INFO,
+        "where": "Parcel_Address LIKE '%UNION%'",
+        "out_fields": "Parcel_ID,Parcel_Address",
+        "limit": 10,
+    })
+    t = text_of(r)
+    ok = "Forbidden keyword" not in t and not r.get("result", {}).get("isError")
+    check("regression: UNION inside a string literal allowed", ok, t[:80])
+except Exception as e:
+    check("regression: UNION inside a string literal allowed", False, repr(e))
+
+# 19. the assessor-trap banner fires on PropertyInformation_Hosted
+try:
+    r = call_tool("query_data", {"item_id": PROPERTY_INFO, "limit": 1})
+    t = text_of(r)
+    check("assessor trap banner present", "ASSESSOR DATA TRAPS" in t, t[:70])
+except Exception as e:
+    check("assessor trap banner present", False, repr(e))
+
+
 
 print("\n=== SUMMARY ===")
 n_pass = sum(1 for _, ok in results if ok)
