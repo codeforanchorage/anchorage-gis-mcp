@@ -23,7 +23,9 @@ uv run pytest tests/ --cov=core --cov=plugins --cov-report=term-missing  # With 
 # Linting (ruff)
 uv run ruff check core/ plugins/ server/ tests/      # Check
 uv run ruff check core/ plugins/ server/ tests/ --fix # Auto-fix
-uv run ruff format core/ plugins/ server/ tests/      # Format
+# Do NOT run `ruff format` across the repo. The source is hand-wrapped to
+# ~79 cols and is not format-clean; a wholesale run produces a diff
+# thousands of lines long that buries real changes. `ruff check` is the bar.
 
 # Pre-commit hooks
 pre-commit run --all-files
@@ -54,7 +56,7 @@ Claude (stdio) → Go client (client/) or stdio_bridge.py → HTTP POST /mcp
 - `core/interfaces.py` — Abstract bases: `MCPPlugin`, `DataPlugin`, plus `ToolDefinition`, `ToolResult`, `PluginType` enum
 - `core/plugin_manager.py` — Discovers plugins by scanning `plugins/` and `custom_plugins/` for `plugin.py` files. Registers tools with `pluginname__toolname` prefix. Routes `tools/call` to the correct plugin.
 - `core/mcp_server.py` — Handles MCP JSON-RPC methods: `initialize`, `tools/list`, `tools/call`, `ping`
-- `core/validators.py` — Loads config from `config.yaml` (local) or `OPENCONTEXT_CONFIG` env var (Lambda). Enforces single-plugin rule.
+- `core/validators.py` — Loads and validates config; enforces the single-plugin rule. On Lambda the file comes from the deployment package, not the env var — see Configuration below.
 - `server/adapters/aws_lambda.py` — AWS Lambda entry point (handler: `server.adapters.aws_lambda.lambda_handler`). The only one; a second, unreferenced `server/lambda_handler.py` was removed.
 - `server/http_handler.py` — Cloud-agnostic HTTP handler shared by Lambda and local server
 - `stdio_bridge.py` — Python stdio-to-HTTP bridge for connecting Claude Desktop/Code to the local server (alternative to Go client)
@@ -67,7 +69,11 @@ New plugins must implement `MCPPlugin` (or `DataPlugin` for data sources). Place
 
 ## Configuration
 
-Copy `config-example.yaml` to `config.yaml`. Enable exactly one plugin. Config supports `${ENV_VAR}` substitution. For Lambda, config is serialized to the `OPENCONTEXT_CONFIG` env var by Terraform.
+Copy `config-example.yaml` to `config.yaml`. Enable exactly one plugin. Config supports `${ENV_VAR}` substitution.
+
+**On Lambda, `config.yaml` ships INSIDE the deployment zip** — `scripts/deploy.sh` copies it into the package and `http_handler.py` reads it from `$LAMBDA_TASK_ROOT` at runtime. Terraform deliberately sets `OPENCONTEXT_CONFIG = ""`. The env var is still honoured when non-empty, but it must stay empty: AWS caps total Lambda env-var size at 4KB, and serialising the config there broke `terraform apply` once the `instructions` block grew past ~3KB. Do not move config back into it, and keep other env vars small.
+
+Two AWS sizing values are read from `config.yaml` in preference to `terraform/aws/prod.tfvars` — `lambda_memory` and `lambda_timeout` (see the `locals` block in `terraform/aws/main.tf`). Editing them in the tfvars alone silently does nothing. `lambda_name` uses the opposite precedence, so check `main.tf` per variable rather than assuming.
 
 ## CI
 
