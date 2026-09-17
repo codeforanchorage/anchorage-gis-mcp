@@ -91,9 +91,27 @@ class TestInitialize:
         assert response["result"]["protocolVersion"] == "2025-11-25"
 
     @pytest.mark.asyncio
-    async def test_initialize_does_not_claim_2026_07_28(self):
-        """2026-07-28 drops the handshake entirely -- we must not claim it."""
-        assert "2026-07-28" not in MCPServer.SUPPORTED_PROTOCOL_VERSIONS
+    async def test_initialize_never_negotiates_a_modern_version(self):
+        """2026-07-28 drops the handshake entirely, so it is served via
+        per-request _meta (see TestModernEra) and must never be echoed on
+        an initialize response, even though it IS a supported version."""
+        assert "2026-07-28" in MCPServer.SUPPORTED_PROTOCOL_VERSIONS
+        assert "2026-07-28" not in MCPServer.LEGACY_PROTOCOL_VERSIONS
+
+        plugin_manager = MagicMock(spec=PluginManager)
+        plugin_manager.config = {}
+        server = MCPServer(plugin_manager)
+
+        response = await server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": "2026-07-28"},
+            }
+        )
+
+        assert response["result"]["protocolVersion"] == "2025-03-26"
 
     @pytest.mark.asyncio
     async def test_initialize_unsupported_version_falls_back(self):
@@ -679,8 +697,9 @@ class TestHTTPRequestHandling:
 
         response = await server.handle_http_request(request_body)
 
-        assert response["statusCode"] == 200
-        assert response["body"] == ""  # Empty body for notifications
+        # Streamable HTTP: an accepted notification is 202 with no body.
+        assert response["statusCode"] == 202
+        assert response["body"] == ""
 
     @pytest.mark.asyncio
     async def test_handle_http_request_preserves_headers(self):
