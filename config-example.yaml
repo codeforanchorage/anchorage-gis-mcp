@@ -23,6 +23,8 @@
 ---
 # Server metadata
 server_name: "Your Organization OpenData MCP" # e.g., "Boston OpenData MCP"
+# Optional: sent as serverInfo.websiteUrl to clients on MCP 2025-11-25+
+# server_website_url: "https://github.com/your-org/your-mcp"
 description: "Your organization's open data MCP server - Safe, conversational access to your open data"
 organization: "Your Organization Name" # e.g., "City of Boston"
 

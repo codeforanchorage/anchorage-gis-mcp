@@ -543,3 +543,63 @@ class TestTraceContextLogging:
         )
         assert not hasattr(rec, "otel_traceparent")
 
+
+
+class TestWebsiteUrl:
+    """serverInfo.websiteUrl (Implementation field since 2025-11-25) comes
+    from ``server_website_url`` and reaches only revisions that define
+    it -- older sessions keep the exact name/version shape."""
+
+    URL = "https://github.com/codeforanchorage/anchorage-gis-mcp"
+
+    def _cfg(self):
+        return {"server_name": "Anchorage GIS MCP",
+                "server_website_url": self.URL}
+
+    @staticmethod
+    def _initialize(version):
+        return {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": version}}
+
+    @pytest.mark.asyncio
+    async def test_modern_discover_carries_website_url(self):
+        response = await _server(self._cfg()).handle_request(
+            CLAUDE_AI_DISCOVER
+        )
+        info = response["result"]["_meta"][META_SERVER_INFO]
+        assert info["websiteUrl"] == self.URL
+
+    @pytest.mark.asyncio
+    async def test_modern_tools_list_carries_website_url(self):
+        response = await _server(self._cfg()).handle_request(
+            _request("tools/list", capabilities={})
+        )
+        info = response["result"]["_meta"][META_SERVER_INFO]
+        assert info["websiteUrl"] == self.URL
+
+    @pytest.mark.asyncio
+    async def test_initialize_2025_11_25_carries_website_url(self):
+        response = await _server(self._cfg()).handle_request(
+            self._initialize("2025-11-25")
+        )
+        assert response["result"]["serverInfo"]["websiteUrl"] == self.URL
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "version", ["2025-06-18", "2025-03-26", "2024-11-05", "bogus"]
+    )
+    async def test_older_revisions_omit_website_url(self, version):
+        response = await _server(self._cfg()).handle_request(
+            self._initialize(version)
+        )
+        assert response["result"]["serverInfo"] == {
+            "name": "Anchorage GIS MCP",
+            "version": "1.0.0",
+        }
+
+    @pytest.mark.asyncio
+    async def test_unset_config_omits_website_url(self):
+        response = await _server().handle_request(
+            self._initialize("2025-11-25")
+        )
+        assert "websiteUrl" not in response["result"]["serverInfo"]

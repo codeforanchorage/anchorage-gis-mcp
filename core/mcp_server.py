@@ -436,7 +436,7 @@ class MCPServer:
         result: Dict[str, Any] = {
             "protocolVersion": protocol_version,
             "capabilities": self._capabilities(),
-            "serverInfo": self._server_info(),
+            "serverInfo": self._server_info(protocol_version),
         }
 
         # Optional per-deployment guidance string surfaced to the client/model.
@@ -523,12 +523,32 @@ class MCPServer:
 
     # ── Shared ────────────────────────────────────────────────────────
 
-    def _server_info(self) -> Dict[str, str]:
+    # First revision whose Implementation schema defines websiteUrl.
+    WEBSITE_URL_MIN_VERSION = "2025-11-25"
+
+    def _server_info(
+        self, protocol_version: Optional[str] = None
+    ) -> Dict[str, str]:
+        """serverInfo (an MCP ``Implementation``) for the given revision.
+
+        ``websiteUrl`` comes from ``server_website_url`` in config and is
+        sent only to revisions that define it (2025-11-25 onward); older
+        sessions get exactly the name/version they always did. Revision
+        strings are ISO dates, so string comparison orders them. ``None``
+        means the modern era, which always qualifies.
+        """
         config = self.plugin_manager.config or {}
-        return {
+        info = {
             "name": config.get("server_name", "OpenContext"),
             "version": str(config.get("server_version", "1.0.0")),
         }
+        website_url = config.get("server_website_url")
+        if website_url and (
+            protocol_version is None
+            or protocol_version >= self.WEBSITE_URL_MIN_VERSION
+        ):
+            info["websiteUrl"] = str(website_url)
+        return info
 
     @staticmethod
     def _capabilities() -> Dict[str, Any]:
