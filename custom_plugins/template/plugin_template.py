@@ -144,7 +144,8 @@ class MyCustomPlugin(MCPPlugin):
                     content=[
                         {
                             "type": "text",
-                            "text": "Tool executed successfully",  # TODO: Return actual result
+                            # TODO: Return actual result
+                            "text": f"Tool executed with param1={param1!r}",
                         }
                     ],
                     success=True,

@@ -6,7 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 # Install dependencies (uv preferred, pip fallback)
-uv sync                              # or: pip install -r requirements.txt
+uv sync --extra dev                  # or: pip install -r requirements-dev.txt
+# Lambda runs python3.11 and deploy.sh resolves requirements.txt fresh on
+# every deploy (uv.lock is NOT used for packaging). To test what prod runs:
+#   uv lock --upgrade && uv run --python 3.11 --extra dev pytest -n auto
 
 # Run local MCP server (no Lambda needed)
 python3 scripts/local_server.py      # Serves on http://localhost:8000/mcp
@@ -87,4 +90,4 @@ Two AWS sizing values are read from `config.yaml` in preference to `terraform/aw
 
 ## CI
 
-GitHub Actions (`.github/workflows/ci.yml`) runs ruff lint/format, pip-audit, pytest with coverage, and Go tests on push to main/develop and on PRs.
+There is none: the GitHub Actions workflows were removed in `797db13` (this fork is for sharing, not CI). The local gates before a deploy are `ruff check .`, `pytest`, `pip-audit -r requirements.txt`, and after deploying `python scripts/smoke_prod.py` (29 checks, both protocol eras).

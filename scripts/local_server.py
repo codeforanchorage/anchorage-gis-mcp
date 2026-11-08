@@ -14,13 +14,13 @@ project_root = Path(__file__).parent.parent.resolve()
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-import yaml
-from aiohttp import web
+import yaml  # noqa: E402
+from aiohttp import web  # noqa: E402
 
-from core.logging_utils import configure_json_logging
-from core.validators import get_logging_config
-from server import http_handler
-from server.http_handler import UniversalHTTPHandler
+from core.logging_utils import configure_json_logging  # noqa: E402
+from core.validators import get_logging_config  # noqa: E402
+from server import http_handler  # noqa: E402
+from server.http_handler import UniversalHTTPHandler  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
