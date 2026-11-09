@@ -361,6 +361,35 @@ try:
 except Exception as e:
     check("modern: server/discover", False, repr(e))
 
+# 20b. serverInfo.websiteUrl (config `server_website_url`) is revision-
+# gated: present for 2026-07-28 and 2025-11-25 (the revision that added it
+# to Implementation), absent for older sessions. Check 2 initializes at
+# 2025-03-26, so without this nothing would notice the field going missing.
+WEBSITE_URL = "https://github.com/codeforanchorage/anchorage-gis-mcp"
+try:
+    _, r = modern("server/discover")
+    modern_url = (r.get("result", {}).get("_meta", {})
+                  .get("io.modelcontextprotocol/serverInfo", {})
+                  .get("websiteUrl"))
+    init_info = {}
+    for v in ("2025-11-25", "2025-06-18"):
+        init_info[v] = rpc(
+            "initialize",
+            {"protocolVersion": v, "capabilities": {},
+             "clientInfo": {"name": "smoke", "version": "1.0"}},
+        )["result"]["serverInfo"]
+    ok = (
+        modern_url == WEBSITE_URL
+        and init_info["2025-11-25"].get("websiteUrl") == WEBSITE_URL
+        and "websiteUrl" not in init_info["2025-06-18"]
+    )
+    check("serverInfo.websiteUrl revision-gated", ok,
+          f"modern={modern_url} "
+          f"2025-11-25={init_info['2025-11-25'].get('websiteUrl')} "
+          f"2025-06-18={init_info['2025-06-18'].get('websiteUrl')}")
+except Exception as e:
+    check("serverInfo.websiteUrl revision-gated", False, repr(e))
+
 # 21. tools/list carries the CacheableResult hints and resultType
 try:
     status, r = modern("tools/list")

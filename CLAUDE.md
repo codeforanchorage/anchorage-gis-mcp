@@ -92,4 +92,4 @@ Two AWS sizing values are read from `config.yaml` in preference to `terraform/aw
 
 ## CI
 
-There is none: the GitHub Actions workflows were removed in `797db13` (this fork is for sharing, not CI). The local gates before a deploy are `ruff check .`, `pytest`, `pip-audit -r requirements.txt`, and after deploying `python scripts/smoke_prod.py` (29 checks, both protocol eras).
+There is none: the GitHub Actions workflows were removed in `797db13` (this fork is for sharing, not CI). The local gates before a deploy are `ruff check .`, `pytest`, `pip-audit -r requirements.txt`, and after deploying `python scripts/smoke_prod.py` (30 checks, both protocol eras).

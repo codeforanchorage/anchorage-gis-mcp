@@ -1,8 +1,12 @@
-httpx>=0.27.0
+# Floors = the versions tested on python3.14 and deployed 2026-11-08.
+# deploy.sh resolves the newest versions that satisfy these on every build,
+# so they only stop a resolver from picking something older than tested.
+# Keep in step with [project].dependencies in pyproject.toml.
+httpx>=0.28.1
 pyclipper>=1.4.0
-pydantic>=2.0.0
-PyYAML>=6.0
-tenacity>=8.0.0
-python-json-logger>=2.0.0
-sqlparse>=0.4.4
-aiohttp>=3.8.0
+pydantic>=2.14.3
+PyYAML>=6.0.3
+tenacity>=9.2.1
+python-json-logger>=4.2.0
+sqlparse>=0.6.1
+aiohttp>=3.14.5
