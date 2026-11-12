@@ -6,6 +6,8 @@ discovering maps, apps, and spatial datasets published by MOA GIS.
 """
 
 import asyncio
+import contextvars
+import copy
 import json
 import logging
 import math
@@ -13,7 +15,7 @@ import re
 import time
 from collections import Counter, OrderedDict, defaultdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -35,6 +37,34 @@ from plugins.arcgis.where_validator import (
 
 logger = logging.getLogger(__name__)
 
+# ── Upstream resilience ─────────────────────────────────────────────────
+#
+# One tool call can make many upstream requests (item lookup, layer
+# metadata, a count, then paged queries). Each is capped at the plugin
+# `timeout` (20s), so without a shared budget two slow ones run past the
+# Lambda's 28s and it is killed mid-flight -- the opaque 502 the timeout
+# ladder exists to prevent. Every request in a call therefore draws from ONE
+# budget, kept under lambda_timeout with room to format and return.
+# tests/test_deployment_config.py pins it below lambda_timeout.
+TOOL_CALL_BUDGET_S = 24.0
+
+# A transient failure (connection reset, DNS blip, upstream 5xx) is retried
+# only while this much of the budget is left: a retry that cannot finish
+# just converts a readable error into a budget-exhausted one. A TIMEOUT is
+# never retried -- it already spent a full per-request timeout.
+RETRY_MIN_REMAINING_S = 4.0
+
+# Deadline (monotonic seconds) of the tool call currently executing. A
+# contextvar, not an attribute: the local server runs calls concurrently on
+# one plugin instance, and gather()ed subtasks inherit it.
+_call_deadline: contextvars.ContextVar[Optional[float]] = (
+    contextvars.ContextVar("anchorage_gis_call_deadline", default=None)
+)
+
+
+class UpstreamTimeoutError(RuntimeError):
+    """ArcGIS did not answer in time. Never retried."""
+
 
 class AnchorageGISPlugin(DataPlugin):
     """Plugin for accessing Municipality of Anchorage GIS data.
@@ -46,7 +76,7 @@ class AnchorageGISPlugin(DataPlugin):
 
     plugin_name = "anchorage_gis"
     plugin_type = PluginType.OPEN_DATA
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
 
     GALLERY_APP_TYPES = [
         "Web Experience",
@@ -96,6 +126,9 @@ class AnchorageGISPlugin(DataPlugin):
         # Bounded to prevent memory exhaustion via agg_where variants that
         # miss the cache (e.g. "1=1 AND 1=1" vs "1=1 AND 2=2").
         self._agg_layer_cache: "OrderedDict[Tuple[str, str, str], Tuple[float, List[Dict[str, Any]]]]" = OrderedDict()
+        # LRU {key: (expires_monotonic, json)} for portal item records and
+        # layer/service ?f=json metadata. See META_CACHE_TTL_S.
+        self._meta_cache: "OrderedDict[str, Tuple[float, Dict[str, Any]]]" = OrderedDict()
 
     async def initialize(self) -> bool:
         try:
@@ -151,7 +184,7 @@ class AnchorageGISPlugin(DataPlugin):
             "sortField": "relevance",
             "sortOrder": "desc",
         }
-        resp = await self.client.get(
+        resp = await self._send("get",
             f"{self.plugin_config.portal_base_url}/search",
             params=params,
         )
@@ -894,18 +927,12 @@ class AnchorageGISPlugin(DataPlugin):
         vector against the calling LLM.
         """
         dataset_id = self._validate_item_id(dataset_id)
-        resp = await self.client.get(
+        # Cached only AFTER the ownership check passes, so a foreign item
+        # is re-fetched and re-rejected every time, never served from cache.
+        return await self._get_meta_json(
             f"{self.plugin_config.portal_base_url}/content/items/{dataset_id}",
-            params={"f": "json"},
+            validate=self._assert_owned_by_configured_org,
         )
-        resp.raise_for_status()
-        item = resp.json()
-        if "error" in item:
-            raise RuntimeError(
-                item["error"].get("message", str(item["error"]))
-            )
-        self._assert_owned_by_configured_org(item)
-        return item
 
     def _assert_owned_by_configured_org(self, item: Dict[str, Any]) -> None:
         """Fail-closed ownership check. Missing orgId is also a rejection."""
@@ -1230,7 +1257,7 @@ class AnchorageGISPlugin(DataPlugin):
             params["orderByFields"] = order_by
 
         try:
-            resp = await self.client.get(query_url, params=params)
+            resp = await self._send("get", query_url, params=params)
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
             raise RuntimeError(
@@ -1321,15 +1348,7 @@ class AnchorageGISPlugin(DataPlugin):
         # Pre-check: layer must be polygon-type for point-in-polygon
         # to make sense. Fail loudly rather than silently returning
         # whatever Intersects happens to hit on a points/lines layer.
-        meta_resp = await self.client.get(
-            service_url, params={"f": "json"}
-        )
-        meta_resp.raise_for_status()
-        meta = meta_resp.json()
-        if "error" in meta:
-            raise RuntimeError(
-                meta["error"].get("message", str(meta["error"]))
-            )
+        meta = await self._get_meta_json(service_url)
         geom_type = meta.get("geometryType", "")
         if geom_type not in (
             "esriGeometryPolygon",
@@ -1354,7 +1373,7 @@ class AnchorageGISPlugin(DataPlugin):
         }
 
         try:
-            resp = await self.client.get(query_url, params=params)
+            resp = await self._send("get", query_url, params=params)
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
             raise RuntimeError(
@@ -1572,7 +1591,7 @@ class AnchorageGISPlugin(DataPlugin):
             # POST because filter polygons routinely exceed URL length
             # limits -- spatial_query_point can get away with GET, this
             # one cannot.
-            resp = await self.client.post(query_url, data=params)
+            resp = await self._send("post", query_url, data=params)
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
             raise RuntimeError(
@@ -1772,13 +1791,7 @@ class AnchorageGISPlugin(DataPlugin):
         url = self._ensure_layer_url(url)
         self._validate_service_url(url)
 
-        meta_resp = await self.client.get(url, params={"f": "json"})
-        meta_resp.raise_for_status()
-        meta = meta_resp.json()
-        if "error" in meta:
-            raise RuntimeError(
-                meta["error"].get("message", str(meta["error"]))
-            )
+        meta = await self._get_meta_json(url)
         geom_type = meta.get("geometryType", "")
         if geom_type not in (
             "esriGeometryPolygon",
@@ -1793,7 +1806,7 @@ class AnchorageGISPlugin(DataPlugin):
 
         # Count first so an over-cap match refuses LOUDLY instead of
         # silently unioning a truncated subset of the filter features.
-        count_resp = await self.client.get(
+        count_resp = await self._send("get",
             query_url,
             params={
                 "where": validated_where,
@@ -1833,7 +1846,7 @@ class AnchorageGISPlugin(DataPlugin):
                 "resultRecordCount": str(self.FILTER_FETCH_PAGE),
                 "resultOffset": str(offset),
             }
-            resp = await self.client.post(query_url, data=params)
+            resp = await self._send("post", query_url, data=params)
             resp.raise_for_status()
             data = resp.json()
             if "error" in data:
@@ -2097,13 +2110,7 @@ class AnchorageGISPlugin(DataPlugin):
             service_url = f"{service_url}/{layer_index}"
 
         self._validate_service_url(service_url)
-        resp = await self.client.get(service_url, params={"f": "json"})
-        resp.raise_for_status()
-        data = resp.json()
-        if "error" in data:
-            raise RuntimeError(
-                data["error"].get("message", str(data["error"]))
-            )
+        data = await self._get_meta_json(service_url)
 
         fields = data.get("fields", [])
         layer_name = data.get("name", data.get("title", "Unknown Layer"))
@@ -2257,7 +2264,7 @@ class AnchorageGISPlugin(DataPlugin):
         ) -> List[Dict[str, Any]]:
             try:
                 # Fetch service root to discover all layers
-                resp = await self.client.get(
+                resp = await self._send("get",
                     url, params={"f": "json"}, timeout=10.0
                 )
                 root = resp.json()
@@ -2270,7 +2277,7 @@ class AnchorageGISPlugin(DataPlugin):
                 for layer_meta in layer_list:
                     layer_id = layer_meta.get("id", 0)
                     try:
-                        lr = await self.client.get(
+                        lr = await self._send("get",
                             f"{url}/{layer_id}",
                             params={"f": "json"},
                             timeout=10.0,
@@ -2520,7 +2527,7 @@ class AnchorageGISPlugin(DataPlugin):
             return None
         query_url = f"{service_url}/query"
         try:
-            resp = await self.client.get(
+            resp = await self._send("get",
                 query_url,
                 params={
                     "where": where,
@@ -2576,11 +2583,7 @@ class AnchorageGISPlugin(DataPlugin):
         except ValueError:
             return {}
         try:
-            resp = await self.client.get(
-                service_url, params={"f": "json"}
-            )
-            resp.raise_for_status()
-            data = resp.json()
+            data = await self._get_meta_json(service_url)
         except Exception:
             return {}
         fields = data.get("fields") or []
@@ -2669,6 +2672,14 @@ class AnchorageGISPlugin(DataPlugin):
     # failed". Keep attempts few and backoff short -- the gateway ceiling is 29s.
     ARCGIS_MAX_ATTEMPTS = 3
     ARCGIS_RETRY_BACKOFF_S = 0.4
+
+    # Portal item records and layer/service metadata (?f=json) change only
+    # when a layer is republished, yet most tools fetch both before every
+    # query. Cached per plugin instance (= per Lambda container). An hour
+    # bounds how stale a republish can look; the entry cap bounds memory,
+    # since the keys are caller-chosen item ids and URLs.
+    META_CACHE_TTL_S = 3600.0
+    META_CACHE_MAX_ENTRIES = 256
 
     # Caps for find_features_spanning_classifications. The source cap is
     # higher than AGG_SOURCE_LIMIT because the spanning analysis only
@@ -3407,14 +3418,7 @@ class AnchorageGISPlugin(DataPlugin):
         return url
 
     async def _fetch_layer_meta(self, layer_url: str) -> Dict[str, Any]:
-        resp = await self.client.get(layer_url, params={"f": "json"})
-        resp.raise_for_status()
-        meta = resp.json()
-        if "error" in meta:
-            raise RuntimeError(
-                meta["error"].get("message", str(meta["error"]))
-            )
-        return meta
+        return await self._get_meta_json(layer_url)
 
     async def _fetch_aggregation_polygons(
         self,
@@ -3520,6 +3524,169 @@ class AnchorageGISPlugin(DataPlugin):
         # Empty message (with or without a code) is the cold-start blip shape.
         return not msg
 
+    # ── Upstream transport: budget, retry, metadata cache ──────────────
+
+    def _request_timeout(self, cap: Optional[float] = None) -> Optional[float]:
+        """Per-request timeout to pass, or None for the client default.
+
+        ``cap`` is a caller's own per-request timeout (e.g. 10s for the
+        layer-inventory fan-out). The result is the smaller of that (or
+        the plugin timeout) and what is left of the call budget; None
+        whenever nothing needs overriding, so the common path passes no
+        extra argument at all.
+        """
+        deadline = _call_deadline.get()
+        if deadline is None:
+            return cap
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise UpstreamTimeoutError(
+                f"ArcGIS did not finish answering within this call's "
+                f"{TOOL_CALL_BUDGET_S:g}s budget. The service may be slow "
+                "right now; try again shortly, or narrow the request (a "
+                "tighter WHERE clause, fewer fields, a smaller limit)."
+            )
+        limit = cap
+        if limit is None:
+            limit = getattr(self.plugin_config, "timeout", None)
+        if limit is not None and remaining < limit:
+            return remaining
+        return cap
+
+    @staticmethod
+    def _url_label(url: str) -> str:
+        """host/path of a URL, for error messages (never the query string)."""
+        parsed = urlparse(url)
+        return f"{parsed.netloc}{parsed.path}" or url
+
+    def _may_retry(self, attempt: int) -> bool:
+        if attempt >= self.ARCGIS_MAX_ATTEMPTS:
+            return False
+        deadline = _call_deadline.get()
+        return (
+            deadline is None
+            or deadline - time.monotonic() >= RETRY_MIN_REMAINING_S
+        )
+
+    async def _backoff(self, attempt: int, url: str, why: str) -> None:
+        logger.warning(
+            "transient ArcGIS failure on %s (%s); retry %d",
+            self._url_label(url),
+            why,
+            attempt,
+        )
+        await asyncio.sleep(self.ARCGIS_RETRY_BACKOFF_S * attempt)
+
+    async def _send_once(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+    ) -> httpx.Response:
+        """One request inside the call budget.
+
+        A timeout raises a readable UpstreamTimeoutError: an httpx timeout
+        stringifies to '', which is how callers used to get a bare "Tool
+        execution failed".
+        """
+        effective = self._request_timeout(timeout)
+        kwargs: Dict[str, Any] = {}
+        if effective is not None:
+            kwargs["timeout"] = effective
+        try:
+            if method == "post":
+                return await self.client.post(url, data=data, **kwargs)
+            return await self.client.get(url, params=params, **kwargs)
+        except httpx.TimeoutException as e:
+            seconds = effective or getattr(self.plugin_config, "timeout", 0)
+            raise UpstreamTimeoutError(
+                f"ArcGIS did not respond within {seconds:.0f}s "
+                f"({type(e).__name__} on {self._url_label(url)}). The "
+                "service may be slow right now; try again shortly, or "
+                "narrow the request (a tighter WHERE clause, fewer fields, "
+                "a smaller limit)."
+            ) from e
+
+    async def _send(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        data: Optional[Dict[str, Any]] = None,
+        timeout: Optional[float] = None,
+    ) -> httpx.Response:
+        """GET/POST for every tool-path request, inside the call budget.
+
+        Retries connection errors and HTTP 5xx while _may_retry allows;
+        never retries a timeout or a 4xx. Returns the final response
+        unchecked, so each caller keeps its own status/JSON handling.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                resp = await self._send_once(
+                    method, url, params=params, data=data, timeout=timeout
+                )
+            except UpstreamTimeoutError:
+                raise
+            except httpx.TransportError as e:
+                if self._may_retry(attempt):
+                    await self._backoff(attempt, url, repr(e))
+                    continue
+                raise RuntimeError(
+                    f"Could not reach ArcGIS ({self._url_label(url)}) after "
+                    f"{attempt} attempt(s): {type(e).__name__}"
+                    f"{': ' + str(e) if str(e) else ''}"
+                ) from e
+            status = getattr(resp, "status_code", None)
+            if (
+                isinstance(status, int)
+                and status >= 500
+                and self._may_retry(attempt)
+            ):
+                await self._backoff(attempt, url, f"HTTP {status}")
+                continue
+            return resp
+
+    async def _get_meta_json(
+        self,
+        url: str,
+        validate: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        """GET ``url?f=json`` through a per-instance TTL/LRU cache.
+
+        For portal item records and layer/service metadata, which change
+        only when a layer is republished. ``validate`` (if given) runs on
+        every fresh fetch before it is cached; failures and ArcGIS error
+        bodies are never cached. Callers get a deep copy, so mutating the
+        result cannot poison the cache.
+        """
+        now = time.monotonic()
+        hit = self._meta_cache.get(url)
+        if hit is not None:
+            if hit[0] > now:
+                self._meta_cache.move_to_end(url)
+                return copy.deepcopy(hit[1])
+            del self._meta_cache[url]
+        resp = await self._send("get", url, params={"f": "json"})
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data:
+            raise RuntimeError(
+                data["error"].get("message", str(data["error"]))
+            )
+        if validate is not None:
+            validate(data)
+        self._meta_cache[url] = (now + self.META_CACHE_TTL_S, data)
+        while len(self._meta_cache) > self.META_CACHE_MAX_ENTRIES:
+            self._meta_cache.popitem(last=False)
+        return copy.deepcopy(data)
+
     async def _request_json_with_retry(
         self,
         url: str,
@@ -3530,23 +3697,24 @@ class AnchorageGISPlugin(DataPlugin):
     ) -> Dict[str, Any]:
         """HTTP request + JSON parse, retrying transient upstream failures.
 
-        Retries httpx transport/timeout errors, HTTP 5xx, and transient
-        ArcGIS error bodies (5xx-class or empty-message). Non-transient
+        Retries httpx connection errors, HTTP 5xx, and transient ArcGIS
+        error bodies (5xx-class or empty-message), while _may_retry allows.
+        Never retries a timeout (see TOOL_CALL_BUDGET_S). Non-transient
         failures (4xx, real ArcGIS errors) raise immediately with a clear
-        message. The final transient failure also raises a clear, non-empty
-        message rather than the opaque empty-string error seen before.
+        message, and so does the final transient one.
         """
         last_desc = "unknown error"
         attempt = 0
-        while attempt < self.ARCGIS_MAX_ATTEMPTS:
+        while True:
             attempt += 1
             transient = False
             try:
-                if method == "post":
-                    resp = await self.client.post(url, data=data)
-                else:
-                    resp = await self.client.get(url, params=params)
-            except (httpx.TransportError, httpx.TimeoutException) as e:
+                resp = await self._send_once(
+                    method, url, params=params, data=data
+                )
+            except UpstreamTimeoutError:
+                raise
+            except httpx.TransportError as e:
                 transient, last_desc = True, f"network error: {e!r}"
             else:
                 status = resp.status_code
@@ -3580,9 +3748,9 @@ class AnchorageGISPlugin(DataPlugin):
                             f"Feature Service query failed: "
                             f"{self._arcgis_error_text(err)}"
                         )
-            if not transient or attempt >= self.ARCGIS_MAX_ATTEMPTS:
+            if not transient or not self._may_retry(attempt):
                 break
-            await asyncio.sleep(self.ARCGIS_RETRY_BACKOFF_S * attempt)
+            await self._backoff(attempt, url, last_desc)
         raise RuntimeError(
             f"Feature Service request failed after {attempt} attempt(s): "
             f"{last_desc}"
@@ -4616,7 +4784,7 @@ class AnchorageGISPlugin(DataPlugin):
                 f"(got geometryType={geom_type or 'unknown'!r})"
             )
 
-        count_resp = await self.client.get(
+        count_resp = await self._send("get",
             f"{container_url}/query",
             params={
                 "where": validated_container_where,
@@ -4809,7 +4977,7 @@ class AnchorageGISPlugin(DataPlugin):
             "orderByFields": field,
             "resultRecordCount": str(limit),
         }
-        resp = await self.client.get(
+        resp = await self._send("get",
             f"{layer_url}/query", params=params
         )
         resp.raise_for_status()
@@ -4974,7 +5142,7 @@ class AnchorageGISPlugin(DataPlugin):
             "returnGeometry": "false",
             "resultRecordCount": str(limit),
         }
-        resp = await self.client.get(
+        resp = await self._send("get",
             f"{layer_url}/query", params=params
         )
         resp.raise_for_status()
@@ -5048,7 +5216,7 @@ class AnchorageGISPlugin(DataPlugin):
                     f"{parcel_field} LIKE '%{safe_sub}%'"
                 )
                 try:
-                    like_resp = await self.client.get(
+                    like_resp = await self._send("get",
                         f"{layer_url}/query",
                         params={
                             "f": "json",
@@ -6040,7 +6208,7 @@ class AnchorageGISPlugin(DataPlugin):
             }
             async with sem:
                 try:
-                    resp = await self.client.post(
+                    resp = await self._send("post",
                         f"{source_url}/query", data=params
                     )
                     resp.raise_for_status()
@@ -6255,7 +6423,7 @@ class AnchorageGISPlugin(DataPlugin):
         # combined with where + outFields, and the upstream silently
         # truncated to zero features. POST sends the same params in
         # the body and is unaffected.
-        attrs_resp = await self.client.post(
+        attrs_resp = await self._send("post",
             f"{source_url}/query",
             data={
                 "where": source_where,
@@ -6315,7 +6483,7 @@ class AnchorageGISPlugin(DataPlugin):
                 where_one = WhereValidator.validate(where_one)
                 async with fallback_sem:
                     try:
-                        r = await self.client.get(
+                        r = await self._send("get",
                             f"{source_url}/query",
                             params={
                                 "where": where_one,
@@ -8424,6 +8592,15 @@ class AnchorageGISPlugin(DataPlugin):
     async def execute_tool(
         self, tool_name: str, arguments: Dict[str, Any]
     ) -> ToolResult:
+        token = _call_deadline.set(time.monotonic() + TOOL_CALL_BUDGET_S)
+        try:
+            return await self._execute_tool(tool_name, arguments)
+        finally:
+            _call_deadline.reset(token)
+
+    async def _execute_tool(
+        self, tool_name: str, arguments: Dict[str, Any]
+    ) -> ToolResult:
         # Only tools that declare an outputSchema set this; it stays None
         # for the rest, and MCPServer omits `structuredContent` entirely
         # when it is None.
@@ -8787,7 +8964,10 @@ class AnchorageGISPlugin(DataPlugin):
             return ToolResult(
                 content=[],
                 success=False,
-                error_message=str(e) if str(e) else "Tool execution failed",
+                # An httpx timeout or connect error stringifies to '', so
+                # name the type rather than return a bare "failed".
+                error_message=str(e)
+                or f"Tool execution failed ({type(e).__name__})",
             )
 
     # ── Health check ──────────────────────────────────────────────────────

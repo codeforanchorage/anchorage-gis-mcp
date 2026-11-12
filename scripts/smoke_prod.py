@@ -11,7 +11,10 @@ import time
 import urllib.error
 import urllib.request
 
-URL = "https://622f4qcew8.execute-api.us-west-2.amazonaws.com/prod/mcp"
+# Optional first argument overrides the target, e.g. the local server:
+#   python scripts/smoke_prod.py http://localhost:8000/mcp
+URL = (sys.argv[1] if len(sys.argv) > 1 else
+       "https://622f4qcew8.execute-api.us-west-2.amazonaws.com/prod/mcp")
 _id = 0
 PASS = "PASS"
 FAIL = "FAIL"

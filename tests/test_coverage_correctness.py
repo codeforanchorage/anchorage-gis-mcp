@@ -143,7 +143,7 @@ class TestAssessorTraps:
     def test_banner_is_gated_to_the_property_layer(self):
         import inspect
 
-        src = inspect.getsource(AnchorageGISPlugin.execute_tool)
+        src = inspect.getsource(AnchorageGISPlugin._execute_tool)
         assert "PROPERTY_INFO_ITEM_ID" in src
         assert AnchorageGISPlugin.PROPERTY_INFO_ITEM_ID == (
             "57d6ff611f444d75a1bf2b4a1d340163"
