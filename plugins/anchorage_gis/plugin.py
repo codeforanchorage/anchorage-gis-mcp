@@ -45,7 +45,8 @@ logger = logging.getLogger(__name__)
 # Lambda's 28s and it is killed mid-flight -- the opaque 502 the timeout
 # ladder exists to prevent. Every request in a call therefore draws from ONE
 # budget, kept under lambda_timeout with room to format and return.
-# tests/test_deployment_config.py pins it below lambda_timeout.
+# tests/test_gis_resilience.py (TestBudgetFitsDeployment) pins it below
+# lambda_timeout.
 TOOL_CALL_BUDGET_S = 24.0
 
 # A transient failure (connection reset, DNS blip, upstream 5xx) is retried
@@ -2245,6 +2246,10 @@ class AnchorageGISPlugin(DataPlugin):
         # parallel against the upstream portal -- a polite-burst that still
         # looks like a small DDoS to muniorg.maps.arcgis.com.
         inspect_sem = asyncio.Semaphore(5)
+        # Services/layers whose metadata could not be read (timeout,
+        # exhausted call budget, upstream error). Counted so a miss is
+        # not reported as a confirmed absence.
+        failed = {"services": 0, "layers": 0}
 
         async def check_service(
             item: Dict[str, Any],
@@ -2299,9 +2304,11 @@ class AnchorageGISPlugin(DataPlugin):
                                 }
                             )
                     except Exception:
+                        failed["layers"] += 1
                         continue
                 return hits
             except Exception:
+                failed["services"] += 1
                 return []
 
         results_raw = await asyncio.gather(
@@ -2310,6 +2317,15 @@ class AnchorageGISPlugin(DataPlugin):
         matches = [m for hits in results_raw for m in hits]
 
         city = self.plugin_config.city_name
+        partial_note = ""
+        if failed["services"] or failed["layers"]:
+            partial_note = (
+                f"\n\n**Partial inspection:** {failed['services']} "
+                f"service(s) and {failed['layers']} layer(s) could not "
+                f"be read (timeout or upstream error), so matching "
+                f"fields there were NOT checked. Retry, or narrow "
+                f"`service_keyword` to inspect fewer services."
+            )
 
         if not matches:
             inspected = "\n".join(
@@ -2325,6 +2341,7 @@ class AnchorageGISPlugin(DataPlugin):
                 f"contain fields matching '{field_keyword}' ({filter_note}).\n\n"
                 f"Inspected services:\n{inspected}\n\n"
                 f"Try a different `service_keyword` to broaden the search."
+                f"{partial_note}"
             )
 
         text = (
@@ -2361,7 +2378,7 @@ class AnchorageGISPlugin(DataPlugin):
             "_Use `get_layer_schema` with an item_id to see the "
             "complete field list._"
         )
-        return text
+        return text + partial_note
 
     # ── Static helpers ────────────────────────────────────────────────────
 
@@ -3417,8 +3434,24 @@ class AnchorageGISPlugin(DataPlugin):
         self._validate_service_url(url)
         return url
 
-    async def _fetch_layer_meta(self, layer_url: str) -> Dict[str, Any]:
-        return await self._get_meta_json(layer_url)
+    async def _fetch_layer_meta(
+        self, layer_url: str, require_fields: Tuple[str, ...] = ()
+    ) -> Dict[str, Any]:
+        """Layer ?f=json, through the metadata cache.
+
+        ``require_fields`` are the caller's field names that it will
+        reject as "not a field" when missing. If a cached copy lacks
+        one, refetch once: a republish that added/renamed the field
+        within META_CACHE_TTL_S must not make a correct name look
+        wrong. A real typo just costs one extra request.
+        """
+        meta = await self._get_meta_json(layer_url)
+        if require_fields:
+            names = {f.get("name") for f in meta.get("fields") or []}
+            if any(f and f not in names for f in require_fields):
+                self._meta_cache.pop(layer_url, None)
+                meta = await self._get_meta_json(layer_url)
+        return meta
 
     async def _fetch_aggregation_polygons(
         self,
@@ -3447,7 +3480,9 @@ class AnchorageGISPlugin(DataPlugin):
             del self._agg_layer_cache[cache_key]
 
         layer_url = await self._resolve_layer_url(aggregation_item_id)
-        meta = await self._fetch_layer_meta(layer_url)
+        meta = await self._fetch_layer_meta(
+            layer_url, require_fields=(group_by_field,)
+        )
         geom_type = meta.get("geometryType", "")
         if geom_type not in (
             "esriGeometryPolygon",
@@ -3896,7 +3931,9 @@ class AnchorageGISPlugin(DataPlugin):
 
         # Fetch source features. Validate sum_fields exist.
         source_url = await self._resolve_layer_url(source_item_id)
-        source_meta = await self._fetch_layer_meta(source_url)
+        source_meta = await self._fetch_layer_meta(
+            source_url, require_fields=tuple(sum_fields)
+        )
         source_fields = {f.get("name") for f in source_meta.get("fields", [])}
         numeric_types = {
             "esriFieldTypeInteger",
@@ -4293,8 +4330,13 @@ class AnchorageGISPlugin(DataPlugin):
 
         target_url = await self._resolve_layer_url(target_item_id)
         overlay_url = await self._resolve_layer_url(overlay_item_id)
-        target_meta = await self._fetch_layer_meta(target_url)
-        overlay_meta = await self._fetch_layer_meta(overlay_url)
+        target_meta = await self._fetch_layer_meta(
+            target_url,
+            require_fields=(target_id_field, target_area_field),
+        )
+        overlay_meta = await self._fetch_layer_meta(
+            overlay_url, require_fields=(overlay_area_field,)
+        )
         poly_types = ("esriGeometryPolygon", "esriGeometryMultiPatch")
         if target_meta.get("geometryType") not in poly_types:
             raise ToolInputError(
@@ -4940,7 +4982,9 @@ class AnchorageGISPlugin(DataPlugin):
         limit = min(self._int_arg(args, "limit", 50), 500)
 
         layer_url = await self._resolve_layer_url(item_id)
-        meta = await self._fetch_layer_meta(layer_url)
+        meta = await self._fetch_layer_meta(
+            layer_url, require_fields=(field,)
+        )
         field_names = {f.get("name") for f in meta.get("fields", [])}
         if field not in field_names:
             raise ToolInputError(
@@ -5106,7 +5150,9 @@ class AnchorageGISPlugin(DataPlugin):
         limit = min(self._int_arg(args, "limit", 10), 100)
 
         layer_url = await self._resolve_layer_url(item_id)
-        meta = await self._fetch_layer_meta(layer_url)
+        meta = await self._fetch_layer_meta(
+            layer_url, require_fields=(parcel_field,)
+        )
         field_names = {f.get("name") for f in meta.get("fields", [])}
         if parcel_field not in field_names:
             raise ToolInputError(
@@ -5962,7 +6008,9 @@ class AnchorageGISPlugin(DataPlugin):
         classification_url = await self._resolve_layer_url(
             classification_item_id
         )
-        cls_meta = await self._fetch_layer_meta(classification_url)
+        cls_meta = await self._fetch_layer_meta(
+            classification_url, require_fields=(classification_field,)
+        )
         cls_geom = cls_meta.get("geometryType", "")
         if cls_geom not in (
             "esriGeometryPolygon",
@@ -6190,11 +6238,12 @@ class AnchorageGISPlugin(DataPlugin):
         src_to_values: Dict[Any, set] = defaultdict(set)
         skipped_polys = 0
         rate_limited = False
+        timed_out = False
 
         async def query_geometry(
             value: Any, esri_geom: Dict[str, Any]
         ) -> None:
-            nonlocal skipped_polys, rate_limited
+            nonlocal skipped_polys, rate_limited, timed_out
             params = {
                 "where": source_where,
                 "geometry": json.dumps(
@@ -6213,6 +6262,10 @@ class AnchorageGISPlugin(DataPlugin):
                     )
                     resp.raise_for_status()
                     data = resp.json()
+                except UpstreamTimeoutError:
+                    timed_out = True
+                    skipped_polys += 1
+                    return
                 except Exception:
                     skipped_polys += 1
                     return
@@ -6321,7 +6374,31 @@ class AnchorageGISPlugin(DataPlugin):
             f">= {min_distinct} distinct values qualify",
             f"**Qualifying:** {len(qualifying):,} feature(s)",
         ]
+        # Structured twin of the "Skipped" line, so structuredContent-only
+        # clients also learn the qualifying count may be an undercount.
+        skip_caveats: List[Dict[str, Any]] = []
         if skipped_polys:
+            skip_caveats.append(
+                {
+                    "code": "classification_polygons_skipped",
+                    "count": skipped_polys,
+                    "message": (
+                        f"{skipped_polys} classification polygon(s) "
+                        f"could not be queried ("
+                        + (
+                            "upstream rate limit"
+                            if rate_limited
+                            else f"ran out of the {TOOL_CALL_BUDGET_S:g}s"
+                            " per-call time budget"
+                            if timed_out
+                            else "geometry too complex or upstream error"
+                        )
+                        + "), so qualifying counts may be an "
+                        "undercount. Retry, or narrow "
+                        "classification_where / source_where."
+                    ),
+                }
+            )
             note = (
                 "Coverage is partial; narrow "
                 "`classification_where` to inspect them separately."
@@ -6332,6 +6409,13 @@ class AnchorageGISPlugin(DataPlugin):
                     "results below are partial. Wait 60s and retry, "
                     "or narrow `classification_where` to reduce the "
                     "per-call query count."
+                )
+            elif timed_out:
+                note = (
+                    "**Some queries ran out of the "
+                    f"{TOOL_CALL_BUDGET_S:g}s per-call time budget** -- "
+                    "results below are partial (an undercount). Retry, "
+                    "or narrow `classification_where` / `source_where`."
                 )
             lines.append(
                 f"**Skipped:** {skipped_polys} classification "
@@ -6407,7 +6491,8 @@ class AnchorageGISPlugin(DataPlugin):
                             f"expected boundary detail."
                         ),
                     }
-                ],
+                ]
+                + skip_caveats,
             }
 
         # Fetch attributes for the qualifying subset, capped at limit.
@@ -6663,7 +6748,7 @@ class AnchorageGISPlugin(DataPlugin):
             "them next._",
         ]
 
-        span_caveats: List[Dict[str, Any]] = []
+        span_caveats: List[Dict[str, Any]] = list(skip_caveats)
         if len(qualifying) > showing:
             span_caveats.append(
                 {

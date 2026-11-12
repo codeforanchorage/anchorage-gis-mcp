@@ -39,7 +39,7 @@ class TestPluginAttributes:
         plugin = AnchorageGISPlugin(anchorage_config)
         assert plugin.plugin_name == "anchorage_gis"
         assert plugin.plugin_type == PluginType.OPEN_DATA
-        assert plugin.plugin_version == "1.0.0"
+        assert plugin.plugin_version == "1.1.0"
 
 
 # ── Initialization ─────────────────────────────────────────────────────

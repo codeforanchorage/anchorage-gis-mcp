@@ -88,6 +88,7 @@ Two AWS sizing values are read from `config.yaml` in preference to `terraform/aw
 |---|---|---|
 | API Gateway integration | 29s | hard REST limit, not adjustable |
 | Lambda (`lambda_timeout`) | 28s | self-terminates before the gateway gives up |
+| Per-call budget (`TOOL_CALL_BUDGET_S`, anchorage_gis) | 24s | shared by every upstream request in one tool call; per-request timeouts shrink to what is left, and 5xx/connection retries stop when <4s remains |
 | Plugin HTTP (`plugins.*.timeout`) | 20s | a hung upstream returns a readable tool error instead of the Lambda being killed mid-flight |
 
 ## CI

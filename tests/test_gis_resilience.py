@@ -288,3 +288,88 @@ class TestBudgetFitsDeployment:
         assert (
             TOOL_CALL_BUDGET_S > config["plugins"]["anchorage_gis"]["timeout"]
         )
+
+
+# ── review fixes: stale-schema refetch, partial field inventory ────────
+
+
+def _meta(*names):
+    return {
+        "geometryType": "esriGeometryPolygon",
+        "fields": [{"name": n, "type": "esriFieldTypeString"} for n in names],
+    }
+
+
+class TestStaleSchemaRefetch:
+    """A cached field list must not reject a field a republish added."""
+
+    @pytest.mark.asyncio
+    async def test_missing_required_field_refetches_once(self, plugin):
+        plugin.client.get = AsyncMock(return_value=_resp(_meta("Old")))
+        await plugin._fetch_layer_meta(LAYER)  # primes the cache
+        plugin.client.get = AsyncMock(
+            return_value=_resp(_meta("Old", "New"))
+        )
+        meta = await plugin._fetch_layer_meta(
+            LAYER, require_fields=("New",)
+        )
+        assert {f["name"] for f in meta["fields"]} == {"Old", "New"}
+        assert plugin.client.get.await_count == 1
+        # The fresh copy replaced the stale one in the cache.
+        again = await plugin._fetch_layer_meta(
+            LAYER, require_fields=("New",)
+        )
+        assert {f["name"] for f in again["fields"]} == {"Old", "New"}
+        assert plugin.client.get.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_present_field_is_a_cache_hit(self, plugin):
+        plugin.client.get = AsyncMock(return_value=_resp(_meta("A")))
+        await plugin._fetch_layer_meta(LAYER)
+        await plugin._fetch_layer_meta(LAYER, require_fields=("A",))
+        assert plugin.client.get.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_typo_costs_one_refetch_then_still_rejects(self, plugin):
+        plugin._resolve_layer_url = AsyncMock(return_value=LAYER)
+        plugin.client.get = AsyncMock(return_value=_resp(_meta("Zone")))
+        await plugin._fetch_layer_meta(LAYER)  # primes the cache
+        with pytest.raises(ToolInputError, match="not a field"):
+            await plugin._fetch_aggregation_polygons(ITEM, "zone", "1=1")
+        assert plugin.client.get.await_count == 2  # prime + one refetch
+
+
+class TestFieldInventoryPartial:
+    """An unreadable service must not read as 'no such field'."""
+
+    @pytest.mark.asyncio
+    async def test_timeouts_are_reported_not_hidden(self, plugin):
+        service = LAYER.rsplit("/", 1)[0]
+        plugin._run_search = AsyncMock(
+            return_value=[{"url": service, "title": "Svc", "id": ITEM}]
+        )
+        plugin.client.get = AsyncMock(side_effect=httpx.ReadTimeout(""))
+        text = await plugin._search_layers_by_field(
+            {"field_keyword": "zone"}
+        )
+        assert "None of the 1" in text
+        assert "Partial inspection" in text
+        assert "1 service(s)" in text
+
+    @pytest.mark.asyncio
+    async def test_clean_miss_has_no_partial_note(self, plugin):
+        service = LAYER.rsplit("/", 1)[0]
+        plugin._run_search = AsyncMock(
+            return_value=[{"url": service, "title": "Svc", "id": ITEM}]
+        )
+        plugin.client.get = AsyncMock(
+            side_effect=[
+                _resp({"layers": [{"id": 0}]}),
+                _resp(_meta("Other")),
+            ]
+        )
+        text = await plugin._search_layers_by_field(
+            {"field_keyword": "zone"}
+        )
+        assert "None of the 1" in text
+        assert "Partial inspection" not in text
