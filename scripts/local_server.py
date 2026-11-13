@@ -51,12 +51,25 @@ async def init_server():
     here instead means a bad config fails at launch rather than on the
     first curl, and lets us print what actually loaded.
     """
-    print("🚀 Initializing OpenContext MCP Server locally...")
+    # No emoji in console output: on Windows, stdout redirected to a file
+    # or pipe falls back to the ANSI codepage (cp1252), which cannot
+    # encode them, and the print raised before the port was ever bound.
+    print("Initializing OpenContext MCP Server locally...")
+
+    # Hand the handler the config this script already parsed, rather
+    # than letting it re-resolve one. The two disagree on what
+    # OPENCONTEXT_CONFIG means: here it is a PATH to a yaml file (e.g.
+    # config-anchorage-gis.yaml), while http_handler._load_config reads
+    # it as an inline JSON blob, which is what Terraform used to inject.
+    # Without this, pointing the env var at a yaml file crashed startup
+    # with a JSONDecodeError. Seeding _config keeps the local convention
+    # working without changing how the handler behaves on Lambda.
+    http_handler._config = config
 
     await http_handler._initialize_server()
 
     plugin_manager = http_handler._plugin_manager
-    print("✅ Server initialized successfully")
+    print("Server initialized successfully")
     print(f"Loaded plugins: {list(plugin_manager.plugins.keys())}")
     print(f"Available tools: {len(plugin_manager.get_all_tools())}")
 
@@ -69,7 +82,15 @@ async def handle_mcp_request(request):
     path/method validation, session IDs, CORS, request logging) lives in
     the handler, so local dev exercises exactly what prod runs.
     """
-    body = await request.text()
+    # Decode leniently rather than via request.text(), which raises on
+    # malformed UTF-8 and would escape as an aiohttp 500. API Gateway
+    # hands the Lambda an already-decoded string with invalid bytes
+    # replaced, so prod answers a malformed body with a normal JSON-RPC
+    # error; matching that here is the difference between local
+    # reproducing prod and local dying on input prod serves. (Easy to
+    # hit: curl on Git Bash re-encodes a non-ASCII -d argument to the
+    # ANSI codepage, so a non-ASCII character arrives as a lone byte.)
+    body = (await request.read()).decode("utf-8", errors="replace")
 
     # HTTP header names are case-insensitive; the handler reads them
     # lowercased, same normalization the Lambda adapter applies.
@@ -172,13 +193,13 @@ async def start_server():
         server_name = "opencontext-mcp"
 
     print("\n" + "=" * 50)
-    print("🌐 Local MCP Server running!")
+    print("Local MCP Server running!")
     print("=" * 50)
     print("URL: http://localhost:8000/mcp")
     print("\n" + "=" * 50)
-    print("📋 Connect via Claude Connectors")
+    print("Connect via Claude Connectors")
     print("=" * 50)
-    print("\n1. Go to Settings → Connectors (or Customize → Connectors on claude.ai)")
+    print("\n1. Go to Settings -> Connectors (or Customize -> Connectors on claude.ai)")
     print("2. Click 'Add custom connector'")
     print("3. Enter a name and URL: http://localhost:8000/mcp")
     print("\nNote: Localhost works with Claude Desktop only (web needs a deployed URL).")
@@ -195,7 +216,7 @@ async def start_server():
     try:
         await asyncio.Event().wait()
     except KeyboardInterrupt:
-        print("\n👋 Shutting down...")
+        print("\nShutting down...")
         if http_handler._plugin_manager is not None:
             await http_handler._plugin_manager.shutdown()
 
