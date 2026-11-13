@@ -66,31 +66,19 @@ class TestSchemasAreWellFormed:
         for name, schema in AnchorageGISPlugin.TOOL_OUTPUT_SCHEMAS.items():
             assert "$ref" not in json.dumps(schema), name
 
-    def test_only_schema_declaring_tools_are_listed(self, plugin):
-        """A tool declaring outputSchema MUST return structured content.
+    def test_every_tool_declares_an_output_schema(self, plugin):
+        """Every tool is structured, so none is prose-only.
 
-        Guards the pairing: adding a name to TOOL_OUTPUT_SCHEMAS without
-        also returning structured_content silently breaks conformance.
+        Claude Code and claude.ai show structuredContent INSTEAD of the
+        text once a tool returns it; a prose-only tool among structured
+        ones is the odd one out. A new tool must arrive with a schema
+        (and the structured_content the schema then obliges).
         """
         declared = set(AnchorageGISPlugin.TOOL_OUTPUT_SCHEMAS)
-        assert declared == {
-            "aggregate_by_polygon",
-            "coverage_by_polygon",
-            "query_data",
-            "spatial_query_point",
-            "spatial_query_polygon",
-            "filter_by_polygon",
-            "get_distinct_values",
-            "find_features_spanning_classifications",
-            "footprint_for_parcel",
-        }
-
         tools = {t.name: t for t in plugin.get_tools()}
-        for name in declared:
-            assert tools[name].output_schema is not None, name
+        assert declared == set(tools)
         for name, tool in tools.items():
-            if name not in declared:
-                assert tool.output_schema is None, name
+            assert tool.output_schema is not None, name
 
     def test_coverage_pct_has_no_upper_bound(self):
         """Areas are counted whole, not clipped, so >100% is real data.
@@ -271,17 +259,18 @@ class TestStructuredContentReachesTheWire:
         )
 
     @pytest.mark.asyncio
-    async def test_prose_only_tools_have_no_structured_content(self, plugin):
-        """Tools without an outputSchema must not emit structuredContent."""
-        with patch.object(
-            plugin, "_find_gis_content", AsyncMock(return_value="text")
-        ):
-            result = await plugin.execute_tool(
-                "find_gis_content", {"topic": "parks"}
-            )
+    async def test_discovery_tool_carries_structured_content(self, plugin):
+        """The former prose-only tools now reach the wire structured too."""
+        plugin._run_search = AsyncMock(return_value=[_item()])
+        result = await plugin.execute_tool(
+            "find_gis_content", {"topic": "parks"}
+        )
 
         assert result.success
-        assert result.structured_content is None
+        _validate(
+            AnchorageGISPlugin.ITEM_SEARCH_OUTPUT_SCHEMA,
+            result.structured_content,
+        )
 
 
 # ── coverage_by_polygon ───────────────────────────────────────────────
@@ -817,3 +806,352 @@ class TestEmptyResultsStillConform:
         declared = set(AnchorageGISPlugin.TOOL_OUTPUT_SCHEMAS)
         # Sanity: the two that regressed in production are covered.
         assert {"spatial_query_point", "spatial_query_polygon"} <= declared
+
+
+# ── discovery / metadata tools ────────────────────────────────────────
+#
+# These were prose-only until they gained schemas. Structured-only
+# clients see nothing else, so beyond conformance the tests pin that the
+# judgement calls the prose makes (queryable or not, the ambiguity
+# warning, an unconfirmed miss) survive into the structured half.
+
+ITEM_SEARCH = AnchorageGISPlugin.ITEM_SEARCH_OUTPUT_SCHEMA
+ITEM_DETAILS = AnchorageGISPlugin.ITEM_DETAILS_OUTPUT_SCHEMA
+LAYER_SCHEMA = AnchorageGISPlugin.LAYER_SCHEMA_OUTPUT_SCHEMA
+FIELD_SEARCH = AnchorageGISPlugin.FIELD_SEARCH_OUTPUT_SCHEMA
+FIND_PARCEL = AnchorageGISPlugin.FIND_PARCEL_OUTPUT_SCHEMA
+
+
+def _item(item_type="Feature Service", item_id="e" * 32, **over):
+    base = {
+        "id": item_id,
+        "title": f"Item {item_id[:4]}",
+        "type": item_type,
+        "snippet": "A layer.",
+        "tags": ["parks", "recreation"],
+        "url": "https://services.arcgis.com/x/arcgis/rest/services/P/"
+        "FeatureServer",
+    }
+    base.update(over)
+    return base
+
+
+def _http(payload):
+    resp = MagicMock()
+    resp.json.return_value = payload
+    resp.raise_for_status.return_value = None
+    return resp
+
+
+class TestItemSearchStructuredOutput:
+    @pytest.mark.asyncio
+    async def test_mixed_results_flag_queryability(self, plugin):
+        plugin._run_search = AsyncMock(
+            side_effect=[
+                [_item("Dashboard", "1" * 32)],
+                [
+                    _item("Feature Service", "2" * 32),
+                    _item("Map Service", "3" * 32),
+                    _item("Web Map", "4" * 32),
+                ],
+            ]
+        )
+        text, structured = await plugin._find_gis_content(
+            {"topic": "parks"}
+        )
+        _validate(ITEM_SEARCH, structured)
+        assert "AMBIGUITY WARNING" in text
+        assert structured["summary"] == {"returned": 4, "queryable": 2}
+        by_id = {i["item_id"]: i for i in structured["items"]}
+        assert by_id["1" * 32]["source"] == "gallery"
+        assert by_id["2" * 32]["source"] == "layers"
+        assert by_id["2" * 32]["queryable"] is True
+        assert by_id["4" * 32]["queryable"] is False
+        codes = {c["code"]: c for c in structured["caveats"]}
+        assert codes["multiple_queryable_layers"]["count"] == 2
+        assert codes["non_queryable_items"]["count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_no_results_carries_retry_advice(self, plugin):
+        plugin._run_search = AsyncMock(return_value=[])
+        _, structured = await plugin._find_gis_content(
+            {"topic": "park parcels"}
+        )
+        _validate(ITEM_SEARCH, structured)
+        assert structured["items"] == []
+        (caveat,) = structured["caveats"]
+        assert caveat["code"] == "no_results"
+        assert "broader" in caveat["message"]
+
+    @pytest.mark.asyncio
+    async def test_sparse_portal_records_conform(self, plugin):
+        """Portal items arrive with nulls and missing keys."""
+        plugin._run_search = AsyncMock(
+            return_value=[
+                {
+                    "id": "5" * 32,
+                    "type": "Feature Service",
+                    "title": None,
+                    "snippet": None,
+                    "tags": None,
+                    "url": None,
+                },
+            ]
+        )
+        _, structured = await plugin._search_spatial_layers(
+            "parks", "all", 10
+        )
+        _validate(ITEM_SEARCH, structured)
+        item = structured["items"][0]
+        assert item["title"] == "Untitled"
+        assert item["tags"] == [] and item["url"] is None
+        assert structured["query"]["layer_type"] == "all"
+        assert structured["caveats"] == []  # one queryable: unqualified
+
+    @pytest.mark.asyncio
+    async def test_gallery_items_are_marked_not_queryable(self, plugin):
+        plugin._run_search = AsyncMock(
+            return_value=[_item("Dashboard"), _item("StoryMap", "6" * 32)]
+        )
+        _, structured = await plugin._browse_gallery("", 20)
+        _validate(ITEM_SEARCH, structured)
+        assert structured["query"]["text"] is None
+        assert structured["summary"]["queryable"] == 0
+        assert [c["code"] for c in structured["caveats"]] == [
+            "non_queryable_items"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_empty_gallery_conforms(self, plugin):
+        plugin._run_search = AsyncMock(return_value=[])
+        _, structured = await plugin._browse_gallery("zzz", 20)
+        _validate(ITEM_SEARCH, structured)
+        assert structured["caveats"][0]["code"] == "no_results"
+
+
+class TestItemDetailsStructuredOutput:
+    def test_full_record_conforms(self, plugin):
+        structured = plugin._item_details_record(
+            _item(
+                owner="moa",
+                access="public",
+                description="<p>Parks</p>",
+                categories=["/Categories/Recreation"],
+                numViews=1234,
+                created=1577836800000,
+                modified=1704067200000,
+                extent=[[-150.0, 61.0], [-149.0, 61.5]],
+            )
+        )
+        _validate(ITEM_DETAILS, structured)
+        item = structured["item"]
+        assert item["created"] == "2020-01-01"
+        assert item["extent"] == {
+            "west": -150.0,
+            "south": 61.0,
+            "east": -149.0,
+            "north": 61.5,
+        }
+        assert structured["caveats"] == []
+
+    def test_sparse_viewer_record_conforms_and_warns(self, plugin):
+        structured = plugin._item_details_record(
+            {
+                "id": "7" * 32,
+                "type": "Web Mapping Application",
+                "extent": [],
+                "numViews": None,
+                "created": None,
+                "description": None,
+            }
+        )
+        _validate(ITEM_DETAILS, structured)
+        assert structured["item"]["extent"] is None
+        assert structured["item"]["created"] is None
+        assert structured["caveats"][0]["code"] == "not_queryable"
+
+    def test_malformed_extent_is_null_not_an_error(self, plugin):
+        structured = plugin._item_details_record(
+            _item(extent=[["a", None], [1]])
+        )
+        _validate(ITEM_DETAILS, structured)
+        assert structured["item"]["extent"] is None
+
+
+LAYER_META = {
+    "name": "Parks",
+    "geometryType": "esriGeometryPolygon",
+    "maxRecordCount": 2000,
+    "fields": [
+        {
+            "name": "OBJECTID",
+            "alias": "OBJECTID",
+            "type": "esriFieldTypeOID",
+        },
+        {
+            "name": "Park_Name",
+            "alias": "Park Name",
+            "type": "esriFieldTypeString",
+        },
+        {
+            "name": "Status",
+            "type": "esriFieldTypeSmallInteger",
+            "domain": {
+                "type": "codedValue",
+                "name": "StatusDom",
+                "codedValues": [
+                    {"code": 1, "name": "Open"},
+                    {"code": 2, "name": "Closed"},
+                ],
+            },
+        },
+    ],
+}
+
+
+class TestLayerSchemaStructuredOutput:
+    def _patch(self, plugin, meta):
+        plugin.get_dataset = AsyncMock(
+            return_value={
+                "url": "https://services.arcgis.com/x/arcgis/rest/"
+                "services/P/FeatureServer",
+                "title": "Parks",
+            }
+        )
+        plugin._get_meta_json = AsyncMock(return_value=meta)
+        plugin._validate_service_url = lambda url: url
+
+    @pytest.mark.asyncio
+    async def test_fields_and_domains(self, plugin):
+        self._patch(plugin, LAYER_META)
+        _, structured = await plugin._get_layer_schema(
+            {"item_id": "e" * 32}
+        )
+        _validate(LAYER_SCHEMA, structured)
+        assert structured["layer"]["service_url"].endswith("/0")
+        assert structured["layer"]["max_record_count"] == 2000
+        fields = {f["name"]: f for f in structured["fields"]}
+        assert fields["Park_Name"]["alias"] == "Park Name"
+        assert fields["Status"]["type"] == "SmallInteger"
+        assert fields["Status"]["coded_values"][1] == {
+            "code": 2,
+            "name": "Closed",
+        }
+        assert "coded_values" not in fields["Park_Name"]
+        assert structured["caveats"] == []
+
+    @pytest.mark.asyncio
+    async def test_keyword_filter_is_flagged(self, plugin):
+        self._patch(plugin, LAYER_META)
+        _, structured = await plugin._get_layer_schema(
+            {"item_id": "e" * 32, "keyword": "name"}
+        )
+        _validate(LAYER_SCHEMA, structured)
+        assert [f["name"] for f in structured["fields"]] == ["Park_Name"]
+        assert structured["caveats"][0]["code"] == "fields_filtered"
+
+    @pytest.mark.asyncio
+    async def test_no_match_and_table_conform(self, plugin):
+        """A non-spatial table with no geometryType, and a keyword miss."""
+        meta = {
+            **LAYER_META,
+            "geometryType": None,
+            "maxRecordCount": None,
+        }
+        self._patch(plugin, meta)
+        _, structured = await plugin._get_layer_schema(
+            {"item_id": "e" * 32, "keyword": "zzz"}
+        )
+        _validate(LAYER_SCHEMA, structured)
+        assert structured["fields"] == []
+        assert structured["layer"]["geometry_type"] is None
+        assert structured["caveats"][0]["code"] == "no_matching_fields"
+
+    @pytest.mark.asyncio
+    async def test_missing_target_is_a_tool_error(self, plugin):
+        result = await plugin.execute_tool("get_layer_schema", {})
+        assert not result.success
+        assert "item_id or service_url" in result.error_message
+
+
+class TestFieldSearchStructuredOutput:
+    @pytest.mark.asyncio
+    async def test_match_conforms(self, plugin):
+        plugin._run_search = AsyncMock(return_value=[_item()])
+        plugin._validate_service_url = lambda url: url
+        plugin._send = AsyncMock(
+            side_effect=[
+                _http({"layers": [{"id": 0}, {"id": 3}]}),
+                _http({"name": "Parks", "fields": LAYER_META["fields"]}),
+                _http({"name": "Other", "fields": []}),
+            ]
+        )
+        _, structured = await plugin._search_layers_by_field(
+            {"field_keyword": "status"}
+        )
+        _validate(FIELD_SEARCH, structured)
+        (match,) = structured["matches"]
+        assert match["layer_name"] == "Parks"
+        assert match["matching_fields"][0]["coded_values"]
+        assert structured["summary"]["layers_matched"] == 1
+        assert structured["query"]["service_keyword"] is None
+        assert structured["caveats"] == []
+
+    @pytest.mark.asyncio
+    async def test_no_candidate_services_conforms(self, plugin):
+        plugin._run_search = AsyncMock(return_value=[])
+        _, structured = await plugin._search_layers_by_field(
+            {"field_keyword": "status", "service_keyword": "zzz"}
+        )
+        _validate(FIELD_SEARCH, structured)
+        assert structured["caveats"][0]["code"] == "no_services_found"
+
+
+class TestFindParcelStructuredOutput:
+    def _patch(self, plugin, *responses):
+        plugin._resolve_layer_url = AsyncMock(return_value="https://x/0")
+        plugin._fetch_layer_meta = AsyncMock(
+            return_value={"fields": [{"name": "Parcel_Num"}]}
+        )
+        plugin._send = AsyncMock(
+            side_effect=[_http(r) for r in responses]
+        )
+
+    @pytest.mark.asyncio
+    async def test_numeric_stored_ids_conform(self, plugin):
+        """A layer may store the parcel id as a number, not a string."""
+        self._patch(
+            plugin,
+            {
+                "features": [
+                    {"attributes": {"Parcel_Num": 121329, "Owner": None}}
+                ]
+            },
+        )
+        _, structured = await plugin._find_parcel(
+            {
+                "item_id": "a" * 32,
+                "parcel_field": "Parcel_Num",
+                "parcel_id": "001-213-29",
+            }
+        )
+        _validate(FIND_PARCEL, structured)
+        assert structured["summary"]["canonical"] == 121329
+        assert structured["query"]["variants"]
+
+    @pytest.mark.asyncio
+    async def test_miss_without_candidates_conforms(self, plugin):
+        self._patch(plugin, {"features": []}, {"features": []})
+        _, structured = await plugin._find_parcel(
+            {
+                "item_id": "a" * 32,
+                "parcel_field": "Parcel_Num",
+                "parcel_id": "001-213-29",
+            }
+        )
+        _validate(FIND_PARCEL, structured)
+        (caveat,) = structured["caveats"]
+        assert caveat["code"] == "parcel_not_found"
+        assert caveat["count"] == 0
+        assert "candidates" not in caveat
+        assert "get_distinct_values" in caveat["message"]

@@ -11,6 +11,13 @@ import time
 import urllib.error
 import urllib.request
 
+try:
+    from jsonschema import ValidationError, validate
+
+    HAVE_JSONSCHEMA = True
+except ImportError:  # the smoke script also runs outside the venv
+    HAVE_JSONSCHEMA = False
+
 # Optional first argument overrides the target, e.g. the local server:
 #   python scripts/smoke_prod.py http://localhost:8000/mcp
 URL = (sys.argv[1] if len(sys.argv) > 1 else
@@ -53,6 +60,18 @@ def check(label, ok, detail=""):
     print(f"[{mark}] {label}" + (f" -- {detail}" if detail else ""))
 
 
+# Advertised outputSchemas (filled from tools/list) and the structured
+# results of the discovery tools, validated together after section 16.
+schemas = {}
+structured_seen = []
+
+
+def keep_structured(name, resp):
+    structured_seen.append(
+        (name, resp.get("result", {}).get("structuredContent"))
+    )
+
+
 # 1. ping
 # The spec defines the ping result as an empty object -- the liveness signal
 # is the successful response itself, not its body.
@@ -91,12 +110,23 @@ try:
         and "anchorage_gis__footprint_for_parcel" in tools,
         f"{len(tools)} tools",
     )
+    schemas = {
+        t["name"].split("__", 1)[-1]: t.get("outputSchema")
+        for t in r["result"]["tools"]
+    }
+    missing = sorted(n for n, s in schemas.items() if not s)
+    check(
+        "every tool declares an outputSchema",
+        bool(schemas) and not missing,
+        f"missing: {missing}" if missing else f"{len(schemas)} tools",
+    )
 except Exception as e:
     check("tools/list", False, repr(e))
 
 # 4. find_gis_content (discovery)
 try:
     r = call_tool("find_gis_content", {"topic": "parks", "limit": 6})
+    keep_structured("find_gis_content", r)
     t = text_of(r)
     check("find_gis_content(parks)", "ID:" in t, f"{len(t)} chars")
 except Exception as e:
@@ -109,6 +139,7 @@ try:
         "search_spatial_layers",
         {"query": "parks", "layer_type": "layers", "limit": 8},
     )
+    keep_structured("search_spatial_layers", r)
     import re
     t = text_of(r)
     m = re.search(r"_Feature Service_\s*--\s*ID: `([0-9a-f]{32})`", t)
@@ -121,6 +152,7 @@ except Exception as e:
 if fs_id:
     try:
         r = call_tool("get_item_details", {"item_id": fs_id})
+        keep_structured("get_item_details", r)
         t = text_of(r)
         check("get_item_details", "ID:" in t and "Type:" in t, f"{len(t)} chars")
     except Exception as e:
@@ -130,6 +162,7 @@ if fs_id:
 field = None
 try:
     r = call_tool("get_layer_schema", {"item_id": fs_id})
+    keep_structured("get_layer_schema", r)
     t = text_of(r)
     import re
     # schema lists fields; grab a plausible text field name
@@ -241,12 +274,38 @@ except Exception as e:
 # 16. search_layers_by_field with no service_keyword
 try:
     r = call_tool("search_layers_by_field", {"field_keyword": "COUNCIL"})
+    keep_structured("search_layers_by_field", r)
     t = text_of(r)
     check("regression: search_layers_by_field without service_keyword",
           "CommunityCouncil" in t, t[:80])
 except Exception as e:
     check("regression: search_layers_by_field without service_keyword",
           False, repr(e))
+
+# 16b. the discovery tools' structured results conform to the schemas
+# the server itself advertised (they were prose-only before 1.3.0).
+try:
+    problems = []
+    for name, sc in structured_seen:
+        if sc is None:
+            problems.append(f"{name}: no structuredContent")
+        elif HAVE_JSONSCHEMA and schemas.get(name):
+            try:
+                validate(sc, schemas[name])
+            except ValidationError as ve:
+                problems.append(f"{name}: {ve.message[:60]}")
+    seen = sorted({n for n, _ in structured_seen})
+    check(
+        "discovery tools return conforming structuredContent",
+        len(seen) == 5 and not problems,
+        "; ".join(problems) if problems else (
+            ", ".join(seen)
+            + ("" if HAVE_JSONSCHEMA else " (jsonschema absent: presence only)")
+        ),
+    )
+except Exception as e:
+    check("discovery tools return conforming structuredContent", False,
+          repr(e))
 
 # 17. aggregate_by_polygon with a POLYLINE source
 try:

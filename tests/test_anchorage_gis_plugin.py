@@ -39,7 +39,7 @@ class TestPluginAttributes:
         plugin = AnchorageGISPlugin(anchorage_config)
         assert plugin.plugin_name == "anchorage_gis"
         assert plugin.plugin_type == PluginType.OPEN_DATA
-        assert plugin.plugin_version == "1.1.0"
+        assert plugin.plugin_version == "1.2.0"
 
 
 # ── Initialization ─────────────────────────────────────────────────────
@@ -3924,7 +3924,7 @@ class TestFindParcel:
             plugin.client = Mock()
             plugin.client.get = fake_get
 
-            text = await plugin._find_parcel({
+            text, structured = await plugin._find_parcel({
                 "item_id": "a" * 32,
                 "parcel_field": "Parcel_Num",
                 "parcel_id": "003-184-87",
@@ -3933,6 +3933,11 @@ class TestFindParcel:
         assert "00318487000" in text
         assert "Canonical form for this layer" in text
         assert "P-464" in text  # other fields surfaced too
+        # The structured half carries the same answer for clients that
+        # show only structuredContent.
+        assert structured["summary"]["matched"] is True
+        assert structured["summary"]["canonical"] == "00318487000"
+        assert structured["rows"][0]["Parcel_Num"] == "00318487000"
 
     @pytest.mark.asyncio
     async def test_no_match_falls_back_to_like(self, plugin):
@@ -3969,7 +3974,7 @@ class TestFindParcel:
             plugin.client = Mock()
             plugin.client.get = fake_get
 
-            text = await plugin._find_parcel({
+            text, structured = await plugin._find_parcel({
                 "item_id": "a" * 32,
                 "parcel_field": "Parcel_Num",
                 "parcel_id": "001-213-29",
@@ -3978,6 +3983,11 @@ class TestFindParcel:
         assert "no exact match" in text
         assert "LIKE fallback" in text
         assert "00121329111" in text
+        assert structured["summary"]["matched"] is False
+        assert structured["summary"]["canonical"] is None
+        (caveat,) = structured["caveats"]
+        assert caveat["code"] == "parcel_not_found"
+        assert {"Parcel_Num": "00121329111"} in caveat["candidates"]
         assert "00121329222" in text
 
     @pytest.mark.asyncio

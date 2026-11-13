@@ -349,12 +349,16 @@ class TestFieldInventoryPartial:
             return_value=[{"url": service, "title": "Svc", "id": ITEM}]
         )
         plugin.client.get = AsyncMock(side_effect=httpx.ReadTimeout(""))
-        text = await plugin._search_layers_by_field(
+        text, structured = await plugin._search_layers_by_field(
             {"field_keyword": "zone"}
         )
         assert "None of the 1" in text
         assert "Partial inspection" in text
         assert "1 service(s)" in text
+        # Structured-only clients must see the miss is unconfirmed too.
+        assert structured["summary"]["services_failed"] == 1
+        codes = [c["code"] for c in structured["caveats"]]
+        assert codes == ["no_matching_fields", "partial_inspection"]
 
     @pytest.mark.asyncio
     async def test_clean_miss_has_no_partial_note(self, plugin):
@@ -368,8 +372,11 @@ class TestFieldInventoryPartial:
                 _resp(_meta("Other")),
             ]
         )
-        text = await plugin._search_layers_by_field(
+        text, structured = await plugin._search_layers_by_field(
             {"field_keyword": "zone"}
         )
         assert "None of the 1" in text
         assert "Partial inspection" not in text
+        assert structured["summary"]["services_failed"] == 0
+        codes = [c["code"] for c in structured["caveats"]]
+        assert codes == ["no_matching_fields"]

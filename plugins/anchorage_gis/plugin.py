@@ -77,7 +77,7 @@ class AnchorageGISPlugin(DataPlugin):
 
     plugin_name = "anchorage_gis"
     plugin_type = PluginType.OPEN_DATA
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
 
     GALLERY_APP_TYPES = [
         "Web Experience",
@@ -384,6 +384,205 @@ class AnchorageGISPlugin(DataPlugin):
                 "related Feature Service."
             ]
         return "\n".join(lines)
+
+    # ── Structured records for the discovery tools ───────────────────
+
+    @staticmethod
+    def _str_list(raw: Any) -> List[str]:
+        """A portal list field (tags, categories) as strings, or []."""
+        if not isinstance(raw, list):
+            return []
+        return [str(v) for v in raw if v is not None]
+
+    def _item_record(
+        self, item: Dict[str, Any], source: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """One portal item as an ITEM_SEARCH_OUTPUT_SCHEMA `items` entry."""
+        item_id = str(item.get("id") or "")
+        record: Dict[str, Any] = {
+            "item_id": item_id,
+            "title": str(item.get("title") or "Untitled"),
+            "type": str(item.get("type") or "Unknown"),
+            "queryable": item.get("type") in self.QUERYABLE_TYPES,
+            "snippet": (str(item.get("snippet") or "")).strip() or None,
+            "tags": self._str_list(item.get("tags")),
+            "url": str(item["url"]) if item.get("url") else None,
+            "portal_url": (
+                f"{self._portal_home}/home/item.html?id={item_id}"
+            ),
+        }
+        if source is not None:
+            record["source"] = source
+        return record
+
+    def _item_details_record(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """get_item_details' structured half (ITEM_DETAILS_OUTPUT_SCHEMA)."""
+        record = self._item_record(item)
+
+        def _date(ms: Any) -> Optional[str]:
+            rendered = self._ms_to_date(ms)
+            return None if rendered == "Unknown" else rendered
+
+        extent = None
+        raw_extent = item.get("extent") or []
+        if len(raw_extent) == 2:
+            try:
+                extent = {
+                    "west": float(raw_extent[0][0]),
+                    "south": float(raw_extent[0][1]),
+                    "east": float(raw_extent[1][0]),
+                    "north": float(raw_extent[1][1]),
+                }
+            except (IndexError, TypeError, ValueError):
+                extent = None
+
+        num_views = item.get("numViews")
+        description = item.get("description")
+        record.update(
+            {
+                "owner": item.get("owner") or None,
+                "access": item.get("access") or None,
+                "description": (
+                    str(description).strip() or None if description else None
+                ),
+                "categories": self._str_list(item.get("categories")),
+                "num_views": (
+                    num_views
+                    if isinstance(num_views, int)
+                    and not isinstance(num_views, bool)
+                    else None
+                ),
+                "created": _date(item.get("created")),
+                "modified": _date(item.get("modified")),
+                "extent": extent,
+            }
+        )
+        caveats: List[Dict[str, Any]] = []
+        if not record["queryable"]:
+            caveats.append(
+                {
+                    "code": "not_queryable",
+                    "message": (
+                        f"Type '{record['type']}' is not directly "
+                        "queryable: do not pass it to query_data. It "
+                        "may bundle queryable layers -- open portal_url "
+                        "to inspect, or use find_gis_content to find a "
+                        "related Feature Service."
+                    ),
+                }
+            )
+        return {"item": record, "caveats": caveats}
+
+    @staticmethod
+    def _item_list_caveats(
+        records: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """The judgement calls the prose makes about an item list.
+
+        Mirrors the AMBIGUITY WARNING and the QUERYABLE / OTHER split
+        of _format_layer_section, which a structured-only client would
+        otherwise never see.
+        """
+        caveats: List[Dict[str, Any]] = []
+        queryable = sum(1 for r in records if r["queryable"])
+        if queryable >= 2:
+            caveats.append(
+                {
+                    "code": "multiple_queryable_layers",
+                    "count": queryable,
+                    "message": (
+                        "Multiple queryable layers match. They may be "
+                        "maintained by different agencies (municipal vs "
+                        "state vs federal) or cover different subsets "
+                        "(all trails vs nordic trails only). For 'how "
+                        "many?' / 'list all' questions do NOT silently "
+                        "pick the first: query each with limit=1 and "
+                        "report a breakdown, or ask the user which "
+                        "subset they mean. Titles hint at scope (agency "
+                        "prefixes like ADNR, USFS, ParksRec)."
+                    ),
+                }
+            )
+        other = len(records) - queryable
+        if other:
+            caveats.append(
+                {
+                    "code": "non_queryable_items",
+                    "count": other,
+                    "message": (
+                        "Items with queryable=false are web maps, apps, "
+                        "viewers or downloadable files. They cannot be "
+                        "passed to query_data for counts or lists; use "
+                        "get_item_details or find_gis_content to reach "
+                        "the underlying Feature Service."
+                    ),
+                }
+            )
+        return caveats
+
+    def _item_search_result(
+        self,
+        records: List[Dict[str, Any]],
+        *,
+        text: Optional[str],
+        limit: int,
+        layer_type: Optional[str] = None,
+        no_results_message: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Assemble an ITEM_SEARCH_OUTPUT_SCHEMA payload."""
+        if records:
+            caveats = self._item_list_caveats(records)
+        else:
+            caveats = [
+                {
+                    "code": "no_results",
+                    "message": no_results_message or "No items matched.",
+                }
+            ]
+        return {
+            "query": {
+                "text": text or None,
+                "layer_type": layer_type,
+                "limit": limit,
+            },
+            "summary": {
+                "returned": len(records),
+                "queryable": sum(1 for r in records if r["queryable"]),
+            },
+            "items": records,
+            "caveats": caveats,
+        }
+
+    @staticmethod
+    def _field_record(field: Dict[str, Any]) -> Dict[str, Any]:
+        """One layer field as a _FIELD_RECORD_SCHEMA entry."""
+        name = str(field.get("name") or "")
+        record: Dict[str, Any] = {
+            "name": name,
+            "alias": str(field.get("alias") or name),
+            "type": str(field.get("type") or "").replace(
+                "esriFieldType", ""
+            ),
+        }
+        domain = field.get("domain")
+        if isinstance(domain, dict) and domain.get("type") == "codedValue":
+            coded = []
+            for c in domain.get("codedValues") or []:
+                if not isinstance(c, dict):
+                    continue
+                code = c.get("code")
+                if not isinstance(code, (str, int, float, bool)):
+                    code = None if code is None else str(code)
+                label = c.get("name")
+                coded.append(
+                    {
+                        "code": code,
+                        "name": None if label is None else str(label),
+                    }
+                )
+            if coded:
+                record["coded_values"] = coded
+        return record
 
     # Upper bound on how many chars of a single feature's geometry we
     # dump into the response. Simplified polygons are usually well
@@ -1893,7 +2092,9 @@ class AnchorageGISPlugin(DataPlugin):
 
     # ── Additional tool implementations ───────────────────────────────────
 
-    async def _find_gis_content(self, args: Dict[str, Any]) -> str:
+    async def _find_gis_content(
+        self, args: Dict[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
         """Combined search: gallery + spatial layers."""
         topic = args.get("topic", "").strip()
         if not topic:
@@ -1914,9 +2115,21 @@ class AnchorageGISPlugin(DataPlugin):
 
         city = self.plugin_config.city_name
         gallery_url = self.plugin_config.gallery_url
+        records = [
+            self._item_record(i, "gallery") for i in gallery_results
+        ] + [self._item_record(i, "layers") for i in layer_results]
 
         if not gallery_results and not layer_results:
-            return (
+            retry = (
+                "Retry with a broader, simpler keyword. Strip "
+                "qualifiers like 'parcels', 'data', 'boundaries', "
+                "'zones', 'areas' -- e.g. 'park parcels' -> 'parks', "
+                "'flood zone boundaries' -> 'flood', 'school district "
+                "areas' -> 'schools'. Use the most distinctive single "
+                "word first. If still nothing, browse the full "
+                f"gallery: {gallery_url}"
+            )
+            text = (
                 f"No {city} GIS content found for topic '{topic}'.\n\n"
                 f"NEXT STEP: retry with a broader, simpler keyword. "
                 f"Strip qualifiers like 'parcels', 'data', 'boundaries', "
@@ -1926,6 +2139,14 @@ class AnchorageGISPlugin(DataPlugin):
                 f"word first.\n\n"
                 f"If still no results after retry, browse the full "
                 f"gallery: {gallery_url}"
+            )
+            return text, self._item_search_result(
+                records,
+                text=topic,
+                limit=limit,
+                no_results_message=(
+                    f"No {city} GIS content found for '{topic}'. {retry}"
+                ),
             )
 
         text = f"## {city} GIS Content: '{topic}'\n\n"
@@ -1955,7 +2176,9 @@ class AnchorageGISPlugin(DataPlugin):
             "downloadable files (not directly queryable).\n"
             f"_Full gallery: {gallery_url}_"
         )
-        return text
+        return text, self._item_search_result(
+            records, text=topic, limit=limit
+        )
 
     def _format_layer_section(
         self, layer_results: List[Dict[str, Any]]
@@ -2018,15 +2241,28 @@ class AnchorageGISPlugin(DataPlugin):
                 text += self._format_summary(item)
         return text
 
-    async def _browse_gallery(self, keyword: str, limit: int) -> str:
+    async def _browse_gallery(
+        self, keyword: str, limit: int
+    ) -> Tuple[str, Dict[str, Any]]:
         """Browse or search the curated gallery."""
         results = await self._search_gallery(keyword, limit)
         city = self.plugin_config.city_name
         gallery_url = self.plugin_config.gallery_url
+        structured = self._item_search_result(
+            [self._item_record(i) for i in results],
+            text=keyword,
+            limit=limit,
+            no_results_message=(
+                "No gallery items found"
+                + (f" matching {keyword!r}" if keyword else "")
+                + ". Use find_gis_content to also search the org's "
+                "layers."
+            ),
+        )
 
         if not results:
             suffix = f" matching {repr(keyword)}" if keyword else ""
-            return f"No gallery items found{suffix}."
+            return f"No gallery items found{suffix}.", structured
 
         header = (
             f"## {city} GIS Gallery -- '{keyword}' "
@@ -2047,11 +2283,11 @@ class AnchorageGISPlugin(DataPlugin):
             "Feature Service instead.\n"
             f"_Full gallery: {gallery_url}_"
         )
-        return text
+        return text, structured
 
     async def _search_spatial_layers(
         self, query: str, layer_type: str, limit: int
-    ) -> str:
+    ) -> Tuple[str, Dict[str, Any]]:
         """Search raw spatial layers."""
         city = self.plugin_config.city_name
         if layer_type == "layers":
@@ -2062,6 +2298,19 @@ class AnchorageGISPlugin(DataPlugin):
             item_types = self.LAYER_TYPES + self.DATA_TYPES
 
         results = await self._search_org_layers(query, item_types, limit)
+        structured = self._item_search_result(
+            [self._item_record(i) for i in results],
+            text=query,
+            limit=limit,
+            layer_type=layer_type,
+            no_results_message=(
+                f"No {city} spatial layers/data found matching "
+                f"'{query}'. Retry with a broader keyword (strip "
+                "'parcels', 'data', 'boundaries' -- e.g. 'park "
+                "parcels' -> 'parks'), or call find_gis_content to "
+                "also search the curated public gallery."
+            ),
+        )
         if not results:
             return (
                 f"No {city} spatial layers/data found matching "
@@ -2070,7 +2319,7 @@ class AnchorageGISPlugin(DataPlugin):
                 f"'parcels', 'data', 'boundaries' -- e.g. 'park "
                 f"parcels' -> 'parks'), or call `find_gis_content` "
                 f"to also search the curated public gallery."
-            )
+            ), structured
 
         text = (
             f"## {city} Spatial Layers: '{query}' "
@@ -2087,9 +2336,11 @@ class AnchorageGISPlugin(DataPlugin):
             "Pick from the QUERYABLE section above for `query_data` "
             "calls.\n"
         )
-        return text
+        return text, structured
 
-    async def _get_layer_schema(self, args: Dict[str, Any]) -> str:
+    async def _get_layer_schema(
+        self, args: Dict[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
         """Fetch schema for a Feature/Map Service layer."""
         item_id = args.get("item_id", "").strip()
         service_url = args.get("service_url", "").strip()
@@ -2104,7 +2355,9 @@ class AnchorageGISPlugin(DataPlugin):
             item_title = item.get("title", item_id)
 
         if not service_url:
-            return "Error: provide either item_id or service_url."
+            # A caller mistake, so a tool error -- it used to come back
+            # as a successful result whose text happened to say "Error".
+            raise ToolInputError("provide either item_id or service_url.")
 
         service_url = service_url.rstrip("/")
         if not re.search(r"/\d+$", service_url):
@@ -2130,12 +2383,46 @@ class AnchorageGISPlugin(DataPlugin):
                 or keyword in f.get("alias", "").lower()
             ]
 
+        max_records_int = (
+            max_records
+            if isinstance(max_records, int)
+            and not isinstance(max_records, bool)
+            else None
+        )
+        structured: Dict[str, Any] = {
+            "layer": {
+                "item_id": item_id or None,
+                "title": str(item_title) if item_title else None,
+                "name": str(layer_name),
+                "geometry_type": data.get("geometryType") or None,
+                "max_record_count": max_records_int,
+                "service_url": service_url,
+            },
+            "keyword": keyword or None,
+            "fields": [self._field_record(f) for f in fields],
+            "caveats": [],
+        }
+
         if not fields:
-            return (
+            text = (
                 f"No fields matching '{keyword}' in layer '{layer_name}'."
                 if keyword
                 else f"No fields found in layer '{layer_name}'."
             )
+            structured["caveats"].append(
+                {
+                    "code": (
+                        "no_matching_fields" if keyword else "no_fields"
+                    ),
+                    "message": text
+                    + (
+                        " Retry without `keyword` to see every field."
+                        if keyword
+                        else ""
+                    ),
+                }
+            )
+            return text, structured
 
         text = f"## Schema: {item_title}\n"
         text += (
@@ -2213,9 +2500,22 @@ class AnchorageGISPlugin(DataPlugin):
             "To just COUNT matches, set `limit=1` and read the "
             "TOTAL COUNT line in the response."
         )
-        return text
+        if keyword:
+            structured["caveats"].append(
+                {
+                    "code": "fields_filtered",
+                    "count": len(fields),
+                    "message": (
+                        f"Only fields matching '{keyword}' are listed; "
+                        "this is not the layer's full schema."
+                    ),
+                }
+            )
+        return text, structured
 
-    async def _search_layers_by_field(self, args: Dict[str, Any]) -> str:
+    async def _search_layers_by_field(
+        self, args: Dict[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
         """Find services containing a specific field name/alias."""
         field_keyword = args.get("field_keyword", "").strip().lower()
         if not field_keyword:
@@ -2236,9 +2536,67 @@ class AnchorageGISPlugin(DataPlugin):
         clauses.append(effective_service_filter)
         candidates = await self._run_search(" AND ".join(clauses), limit)
 
+        def _structured(
+            matches: List[Dict[str, Any]],
+            failed: Dict[str, int],
+            caveats: List[Dict[str, Any]],
+        ) -> Dict[str, Any]:
+            return {
+                "query": {
+                    "field_keyword": field_keyword,
+                    "service_keyword": service_keyword or None,
+                    "limit": limit,
+                },
+                "summary": {
+                    "services_inspected": len(candidates),
+                    "layers_matched": len(matches),
+                    "services_failed": failed["services"],
+                    "layers_failed": failed["layers"],
+                },
+                "inspected": [
+                    {
+                        "item_id": str(c.get("id") or ""),
+                        "title": str(c.get("title") or "Untitled"),
+                    }
+                    for c in candidates
+                ],
+                "matches": [
+                    {
+                        "item_id": str(m["item"].get("id") or ""),
+                        "title": str(m["item"].get("title") or "Untitled"),
+                        "layer_name": str(m.get("layer_name") or ""),
+                        "layer_index": (
+                            m.get("layer_index")
+                            if isinstance(m.get("layer_index"), int)
+                            else 0
+                        ),
+                        "portal_url": (
+                            f"{self._portal_home}/home/item.html?id="
+                            f"{m['item'].get('id', '')}"
+                        ),
+                        "matching_fields": [
+                            self._field_record(f)
+                            for f in m["matching_fields"]
+                        ],
+                    }
+                    for m in matches
+                ],
+                "caveats": caveats,
+            }
+
         if not candidates:
-            return (
-                f"No services found matching '{effective_service_filter}'."
+            msg = f"No services found matching '{effective_service_filter}'."
+            return msg, _structured(
+                [],
+                {"services": 0, "layers": 0},
+                [
+                    {
+                        "code": "no_services_found",
+                        "message": (
+                            msg + " Try a different service_keyword."
+                        ),
+                    }
+                ],
             )
 
         # Bound concurrent ArcGIS calls. Without this, a 20-candidate search
@@ -2318,6 +2676,7 @@ class AnchorageGISPlugin(DataPlugin):
 
         city = self.plugin_config.city_name
         partial_note = ""
+        caveats: List[Dict[str, Any]] = []
         if failed["services"] or failed["layers"]:
             partial_note = (
                 f"\n\n**Partial inspection:** {failed['services']} "
@@ -2326,8 +2685,28 @@ class AnchorageGISPlugin(DataPlugin):
                 f"fields there were NOT checked. Retry, or narrow "
                 f"`service_keyword` to inspect fewer services."
             )
+            caveats.append(
+                {
+                    "code": "partial_inspection",
+                    "count": failed["services"] + failed["layers"],
+                    "message": partial_note.strip().replace("**", ""),
+                }
+            )
 
         if not matches:
+            caveats.insert(
+                0,
+                {
+                    "code": "no_matching_fields",
+                    "message": (
+                        f"None of the {len(candidates)} services "
+                        f"inspected contain fields matching "
+                        f"'{field_keyword}'. Try a different "
+                        "service_keyword to broaden the search."
+                    ),
+                },
+            )
+            structured = _structured(matches, failed, caveats)
             inspected = "\n".join(
                 f"- {item.get('title', 'Untitled')}" for item in candidates
             )
@@ -2342,7 +2721,7 @@ class AnchorageGISPlugin(DataPlugin):
                 f"Inspected services:\n{inspected}\n\n"
                 f"Try a different `service_keyword` to broaden the search."
                 f"{partial_note}"
-            )
+            ), structured
 
         text = (
             f"## {city} Layers with '{field_keyword}' Fields\n\n"
@@ -2378,7 +2757,7 @@ class AnchorageGISPlugin(DataPlugin):
             "_Use `get_layer_schema` with an item_id to see the "
             "complete field list._"
         )
-        return text + partial_note
+        return text + partial_note, _structured(matches, failed, caveats)
 
     # ── Static helpers ────────────────────────────────────────────────────
 
@@ -5124,7 +5503,16 @@ class AnchorageGISPlugin(DataPlugin):
         ]
         return "\n".join(lines), _structured(values, bool(capped_note))
 
-    async def _find_parcel(self, args: Dict[str, Any]) -> str:
+    @staticmethod
+    def _scalar(value: Any) -> Any:
+        """A raw attribute value narrowed to a JSON scalar."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
+    async def _find_parcel(
+        self, args: Dict[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
         """Look up a parcel across MOA format variants in one call.
 
         The same parcel can appear in different layers as
@@ -5206,6 +5594,13 @@ class AnchorageGISPlugin(DataPlugin):
             )
 
         features = data.get("features", [])
+        query_echo = {
+            "item_id": item_id,
+            "parcel_field": parcel_field,
+            "parcel_id": parcel_id,
+            "variants": [str(v) for v in variants],
+            "limit": limit,
+        }
 
         if features:
             matched_values: set = set()
@@ -5213,6 +5608,24 @@ class AnchorageGISPlugin(DataPlugin):
                 v = (f.get("attributes") or {}).get(parcel_field)
                 if v is not None:
                     matched_values.add(v)
+            ordered = sorted(matched_values, key=str)
+            structured = {
+                "query": query_echo,
+                "summary": {
+                    "returned": len(features),
+                    "matched": True,
+                    "matched_values": [self._scalar(v) for v in ordered],
+                    "canonical": (
+                        self._scalar(sorted(matched_values)[0])
+                        if matched_values
+                        else None
+                    ),
+                },
+                "rows": [
+                    dict(f.get("attributes") or {}) for f in features
+                ],
+                "caveats": [],
+            }
             lines = [
                 f"## Parcel lookup: `{parcel_id}` -> "
                 f"{len(features)} record(s) found",
@@ -5241,7 +5654,7 @@ class AnchorageGISPlugin(DataPlugin):
                 for k, v in attrs.items():
                     lines.append(f"  {k}: {v}")
                 lines.append("")
-            return "\n".join(lines)
+            return "\n".join(lines), structured
 
         # Not found via exact match. Fall back to LIKE on a distinctive
         # digit substring. Skip the first 3 chars (often leading
@@ -5313,7 +5726,51 @@ class AnchorageGISPlugin(DataPlugin):
                 f"like='{substring_used or digits[:6]}')` to discover "
                 f"the storage format._",
             ]
-        return "\n".join(lines)
+
+        if candidates:
+            miss_message = (
+                f"No exact match for {parcel_id!r} in any of "
+                f"{len(variants)} format variants. A LIKE search on "
+                f"'%{substring_used}%' found {len(candidates)} "
+                "candidate(s), listed in `candidates`: pick the right "
+                "one and use its EXACT value for follow-up queries on "
+                "this layer."
+            )
+        else:
+            miss_message = (
+                f"No exact match for {parcel_id!r} and no LIKE "
+                "candidates. The parcel may not exist in this layer, or "
+                "the field stores the id in an unrecognised format; try "
+                f"get_distinct_values(item_id='{item_id}', "
+                f"field='{parcel_field}', "
+                f"like='{substring_used or digits[:6]}') to discover it."
+            )
+        caveat: Dict[str, Any] = {
+            "code": "parcel_not_found",
+            "message": miss_message,
+            "count": len(candidates),
+        }
+        if candidates:
+            caveat["candidates"] = [
+                {
+                    parcel_field: self._scalar(
+                        (c.get("attributes") or {}).get(parcel_field)
+                    )
+                }
+                for c in candidates
+            ]
+        structured = {
+            "query": query_echo,
+            "summary": {
+                "returned": 0,
+                "matched": False,
+                "matched_values": [],
+                "canonical": None,
+            },
+            "rows": [],
+            "caveats": [caveat],
+        }
+        return "\n".join(lines), structured
 
     # ── footprint_for_parcel: lot coverage / ADU headroom ────────────────
     #
@@ -7453,11 +7910,359 @@ class AnchorageGISPlugin(DataPlugin):
         "footprint_for_parcel": "Lot Coverage for Parcel",
     }
 
-    # Tools that return machine-readable results alongside the prose.
-    # Only these two declare an outputSchema; the rest return prose only,
-    # and adding a tool here without also returning structured_content
-    # would break the schema contract, so the pair is tested together.
+    # ── Discovery / metadata tools ──────────────────────────────────
+    #
+    # These used to return prose only. Claude Code and claude.ai show a
+    # tool's structuredContent INSTEAD of its text once one is present,
+    # so anything a model needs from these tools -- above all whether
+    # an item is queryable, and the multiple-layers ambiguity warning --
+    # has to live in the structured half, not just the markdown.
+
+    # A raw attribute value: layers store strings, numbers, booleans
+    # and nulls, and a schema that pinned one type would be violated by
+    # the next layer.
+    _SCALAR_TYPES = ["string", "number", "boolean", "null"]
+
+    _ITEM_RECORD_SCHEMA = {
+        "type": "object",
+        "required": ["item_id", "title", "type", "queryable", "portal_url"],
+        "properties": {
+            "item_id": {"type": "string"},
+            "title": {"type": "string"},
+            "type": {
+                "type": "string",
+                "description": "Portal item type, e.g. 'Feature Service'.",
+            },
+            "queryable": {
+                "type": "boolean",
+                "description": (
+                    "True for Feature/Map Services, Feature Layers and "
+                    "Tables -- the items query_data, get_layer_schema "
+                    "and the spatial_* tools accept. False for web "
+                    "maps, apps, dashboards and downloadable files, "
+                    "which must not be passed to query_data."
+                ),
+            },
+            "snippet": {"type": ["string", "null"]},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "url": {
+                "type": ["string", "null"],
+                "description": (
+                    "The service URL for a layer, or the app URL for "
+                    "a viewer; null when the item has none."
+                ),
+            },
+            "portal_url": {
+                "type": "string",
+                "description": "The item's page on the ArcGIS portal.",
+            },
+            "source": {
+                "type": "string",
+                "enum": ["gallery", "layers"],
+                "description": (
+                    "find_gis_content only: which search found it -- "
+                    "the curated public gallery or the org's layers."
+                ),
+            },
+        },
+    }
+
+    # Shared by find_gis_content, browse_gallery and
+    # search_spatial_layers: all three are portal item searches.
+    ITEM_SEARCH_OUTPUT_SCHEMA = {
+        "type": "object",
+        "required": ["query", "summary", "items", "caveats"],
+        "additionalProperties": False,
+        "properties": {
+            "query": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": ["string", "null"]},
+                    "layer_type": {"type": ["string", "null"]},
+                    "limit": {"type": "integer", "minimum": 0},
+                },
+            },
+            "summary": {
+                "type": "object",
+                "required": ["returned", "queryable"],
+                "properties": {
+                    "returned": {"type": "integer", "minimum": 0},
+                    "queryable": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Items with queryable=true.",
+                    },
+                },
+            },
+            "items": {"type": "array", "items": _ITEM_RECORD_SCHEMA},
+            "caveats": _CAVEATS_SCHEMA,
+        },
+    }
+
+    ITEM_DETAILS_OUTPUT_SCHEMA = {
+        "type": "object",
+        "required": ["item", "caveats"],
+        "additionalProperties": False,
+        "properties": {
+            "item": {
+                "type": "object",
+                "required": [
+                    "item_id", "title", "type", "queryable", "portal_url",
+                ],
+                "properties": {
+                    **_ITEM_RECORD_SCHEMA["properties"],
+                    "owner": {"type": ["string", "null"]},
+                    "access": {"type": ["string", "null"]},
+                    "description": {
+                        "type": ["string", "null"],
+                        "description": "Often HTML, as the portal stores it.",
+                    },
+                    "categories": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "num_views": {"type": ["integer", "null"]},
+                    "created": {
+                        "type": ["string", "null"],
+                        "description": "UTC date, YYYY-MM-DD.",
+                    },
+                    "modified": {
+                        "type": ["string", "null"],
+                        "description": "UTC date, YYYY-MM-DD.",
+                    },
+                    "extent": {
+                        "type": ["object", "null"],
+                        "description": "WGS84 bounding box, degrees.",
+                        "properties": {
+                            "west": {"type": "number"},
+                            "south": {"type": "number"},
+                            "east": {"type": "number"},
+                            "north": {"type": "number"},
+                        },
+                    },
+                },
+            },
+            "caveats": _CAVEATS_SCHEMA,
+        },
+    }
+
+    _FIELD_RECORD_SCHEMA = {
+        "type": "object",
+        "required": ["name", "alias", "type"],
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": (
+                    "The CASE-SENSITIVE name to use in WHERE clauses "
+                    "and out_fields -- not the alias."
+                ),
+            },
+            "alias": {"type": "string"},
+            "type": {
+                "type": "string",
+                "description": (
+                    "Esri field type without the esriFieldType prefix, "
+                    "e.g. 'String', 'Integer', 'Date'."
+                ),
+            },
+            "coded_values": {
+                "type": "array",
+                "description": (
+                    "Present only for coded-value domain fields: the "
+                    "stored `code` (what a WHERE clause compares "
+                    "against) and its display `name`."
+                ),
+                "items": {
+                    "type": "object",
+                    "required": ["code", "name"],
+                    "properties": {
+                        "code": {"type": _SCALAR_TYPES},
+                        "name": {"type": ["string", "null"]},
+                    },
+                },
+            },
+        },
+    }
+
+    LAYER_SCHEMA_OUTPUT_SCHEMA = {
+        "type": "object",
+        "required": ["layer", "fields", "caveats"],
+        "additionalProperties": False,
+        "properties": {
+            "layer": {
+                "type": "object",
+                "required": ["name", "service_url"],
+                "properties": {
+                    "item_id": {"type": ["string", "null"]},
+                    "title": {"type": ["string", "null"]},
+                    "name": {"type": "string"},
+                    "geometry_type": {
+                        "type": ["string", "null"],
+                        "description": "null for a non-spatial table.",
+                    },
+                    "max_record_count": {"type": ["integer", "null"]},
+                    "service_url": {"type": "string"},
+                },
+            },
+            "keyword": {
+                "type": ["string", "null"],
+                "description": (
+                    "The keyword `fields` was filtered by, if any -- "
+                    "a filtered list is not the whole schema."
+                ),
+            },
+            "fields": {"type": "array", "items": _FIELD_RECORD_SCHEMA},
+            "caveats": _CAVEATS_SCHEMA,
+        },
+    }
+
+    FIELD_SEARCH_OUTPUT_SCHEMA = {
+        "type": "object",
+        "required": ["query", "summary", "matches", "caveats"],
+        "additionalProperties": False,
+        "properties": {
+            "query": {
+                "type": "object",
+                "properties": {
+                    "field_keyword": {"type": "string"},
+                    "service_keyword": {"type": ["string", "null"]},
+                    "limit": {"type": "integer", "minimum": 0},
+                },
+            },
+            "summary": {
+                "type": "object",
+                "required": [
+                    "services_inspected",
+                    "layers_matched",
+                    "services_failed",
+                    "layers_failed",
+                ],
+                "properties": {
+                    "services_inspected": {"type": "integer", "minimum": 0},
+                    "layers_matched": {"type": "integer", "minimum": 0},
+                    "services_failed": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": (
+                            "Services whose metadata could not be read, "
+                            "so they were NOT checked. Non-zero means "
+                            "an empty `matches` is not a confirmed "
+                            "absence."
+                        ),
+                    },
+                    "layers_failed": {"type": "integer", "minimum": 0},
+                },
+            },
+            "inspected": {
+                "type": "array",
+                "description": "Every candidate service that was checked.",
+                "items": {
+                    "type": "object",
+                    "required": ["item_id", "title"],
+                    "properties": {
+                        "item_id": {"type": "string"},
+                        "title": {"type": "string"},
+                    },
+                },
+            },
+            "matches": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": [
+                        "item_id",
+                        "title",
+                        "layer_name",
+                        "layer_index",
+                        "matching_fields",
+                    ],
+                    "properties": {
+                        "item_id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "layer_name": {"type": "string"},
+                        "layer_index": {"type": "integer"},
+                        "portal_url": {"type": "string"},
+                        "matching_fields": {
+                            "type": "array",
+                            "items": _FIELD_RECORD_SCHEMA,
+                        },
+                    },
+                },
+            },
+            "caveats": _CAVEATS_SCHEMA,
+        },
+    }
+
+    FIND_PARCEL_OUTPUT_SCHEMA = {
+        "type": "object",
+        "required": ["query", "summary", "rows", "caveats"],
+        "additionalProperties": False,
+        "properties": {
+            "query": {
+                "type": "object",
+                "properties": {
+                    "item_id": {"type": "string"},
+                    "parcel_field": {"type": "string"},
+                    "parcel_id": {"type": "string"},
+                    "variants": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Every format variant tried.",
+                    },
+                    "limit": {"type": "integer", "minimum": 0},
+                },
+            },
+            "summary": {
+                "type": "object",
+                "required": ["returned", "matched", "canonical"],
+                "properties": {
+                    "returned": {"type": "integer", "minimum": 0},
+                    "matched": {
+                        "type": "boolean",
+                        "description": (
+                            "True when a variant matched exactly. When "
+                            "false, see the parcel_not_found caveat's "
+                            "`candidates` for near matches."
+                        ),
+                    },
+                    "matched_values": {
+                        "type": "array",
+                        "items": {"type": _SCALAR_TYPES},
+                    },
+                    "canonical": {
+                        "type": _SCALAR_TYPES,
+                        "description": (
+                            "The parcel id exactly as THIS layer stores "
+                            "it -- use it verbatim in follow-up "
+                            "queries. null when nothing matched."
+                        ),
+                    },
+                },
+            },
+            "rows": {
+                "type": "array",
+                "description": (
+                    "Raw attribute records in the layer's own types "
+                    "(dates are epoch milliseconds)."
+                ),
+                "items": {"type": "object"},
+            },
+            "caveats": _CAVEATS_SCHEMA,
+        },
+    }
+
+    # Every tool declares an outputSchema and returns structured_content
+    # that conforms to it on every success path; the pairing is tested
+    # (tests/test_structured_output.py), so adding a tool here without
+    # also returning structured_content fails the suite.
     TOOL_OUTPUT_SCHEMAS = {
+        "find_gis_content": ITEM_SEARCH_OUTPUT_SCHEMA,
+        "browse_gallery": ITEM_SEARCH_OUTPUT_SCHEMA,
+        "search_spatial_layers": ITEM_SEARCH_OUTPUT_SCHEMA,
+        "get_item_details": ITEM_DETAILS_OUTPUT_SCHEMA,
+        "get_layer_schema": LAYER_SCHEMA_OUTPUT_SCHEMA,
+        "search_layers_by_field": FIELD_SEARCH_OUTPUT_SCHEMA,
+        "find_parcel": FIND_PARCEL_OUTPUT_SCHEMA,
         "aggregate_by_polygon": AGGREGATE_OUTPUT_SCHEMA,
         "coverage_by_polygon": COVERAGE_OUTPUT_SCHEMA,
         # All four render through _format_query_results, so they share
@@ -8692,10 +9497,10 @@ class AnchorageGISPlugin(DataPlugin):
         structured: Optional[Dict[str, Any]] = None
         try:
             if tool_name == "find_gis_content":
-                text = await self._find_gis_content(arguments)
+                text, structured = await self._find_gis_content(arguments)
 
             elif tool_name == "browse_gallery":
-                text = await self._browse_gallery(
+                text, structured = await self._browse_gallery(
                     arguments.get("keyword", "").strip(),
                     min(self._int_arg(arguments, "limit", 20), 100),
                 )
@@ -8708,7 +9513,7 @@ class AnchorageGISPlugin(DataPlugin):
                         success=False,
                         error_message="query is required",
                     )
-                text = await self._search_spatial_layers(
+                text, structured = await self._search_spatial_layers(
                     query,
                     arguments.get("layer_type", "all"),
                     min(self._int_arg(arguments, "limit", 10), 50),
@@ -8724,18 +9529,21 @@ class AnchorageGISPlugin(DataPlugin):
                     )
                 item = await self.get_dataset(item_id)
                 text = self._format_details(item)
+                structured = self._item_details_record(item)
 
             elif tool_name == "get_layer_schema":
-                text = await self._get_layer_schema(arguments)
+                text, structured = await self._get_layer_schema(arguments)
 
             elif tool_name == "get_distinct_values":
                 text, structured = await self._get_distinct_values(arguments)
 
             elif tool_name == "find_parcel":
-                text = await self._find_parcel(arguments)
+                text, structured = await self._find_parcel(arguments)
 
             elif tool_name == "search_layers_by_field":
-                text = await self._search_layers_by_field(arguments)
+                text, structured = await self._search_layers_by_field(
+                    arguments
+                )
 
             elif tool_name == "query_data":
                 item_id = arguments.get("item_id", "").strip()
