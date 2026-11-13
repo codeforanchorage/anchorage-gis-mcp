@@ -601,6 +601,17 @@ class AnchorageGISPlugin(DataPlugin):
     # GeoJSON cell would dominate any table row.
     COMPACT_FORMAT_THRESHOLD = 20
 
+    # Small-table rule: when query_data is called WITHOUT an explicit
+    # `limit` and the matching set has at most this many rows, every row
+    # comes back in one response instead of the default 25. Observed in
+    # prod (Nov 2026): a 39-row lookup table returned "25 of 39,
+    # TRUNCATED", and claude.ai sessions read it as 8 OBJECTID-range
+    # chunks instead. An explicit limit is always honoured -- limit=1 is
+    # the documented counting idiom and must stay one row.
+    SMALL_TABLE_ROW_THRESHOLD = 100
+    # Hard per-call row cap of query_data (its inputSchema maximum).
+    QUERY_MAX_LIMIT = 1000
+
     def _render_field_value(
         self,
         key: str,
@@ -667,6 +678,7 @@ class AnchorageGISPlugin(DataPlugin):
                 "returned": 0,
                 "total_count": 0,
                 "truncated": False,
+                "complete": True,
             },
             "rows": [],
             "caveats": [],
@@ -687,6 +699,7 @@ class AnchorageGISPlugin(DataPlugin):
         coded_domains: Optional[Dict[str, Dict[Any, str]]] = None,
         last_edit_date: Optional[int] = None,
         coverage_pct: Optional[float] = None,
+        auto_expanded_from: Optional[int] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """Render a record set, and return its structured twin.
 
@@ -695,6 +708,10 @@ class AnchorageGISPlugin(DataPlugin):
         spatial_query_point, spatial_query_polygon and
         filter_by_polygon, so all four get structured output from this
         one place.
+
+        ``auto_expanded_from`` is the default limit the small-table rule
+        lifted (see SMALL_TABLE_ROW_THRESHOLD), so the response can say
+        why it holds more rows than the default.
         """
         provenance: List[str] = []
         # Structured twin of the caveats appended to `provenance` below.
@@ -726,7 +743,43 @@ class AnchorageGISPlugin(DataPlugin):
             and len(records) > 0
             and total_count > len(records)
         )
+        complete = (
+            total_count is not None and len(records) == total_count
+        )
         if truncated:
+            # Name the cheapest next step outright. The old hint ("narrow
+            # the WHERE clause to get a complete listing") read as advice
+            # to filter, and models turned it into OBJECTID-range paging:
+            # many calls where one larger `limit` would do.
+            has_geometry_rows = any(
+                r.get("__geometry__") is not None for r in records
+            )
+            one_call_cap = (
+                self.GEOMETRY_LIMIT_CAP
+                if has_geometry_rows
+                else self.QUERY_MAX_LIMIT
+            )
+            if total_count <= one_call_cap:
+                next_step = (
+                    f"To get ALL {total_count:,} rows, repeat this "
+                    f"call ONCE with limit={total_count} (add "
+                    f"out_fields=<only the fields you need> to keep it "
+                    f"small). Do not page by OBJECTID ranges."
+                )
+            else:
+                next_step = (
+                    f"{total_count:,} rows exceed the {one_call_cap:,}"
+                    f"-row cap of one call"
+                    + (
+                        " with return_geometry=true (drop geometry to "
+                        f"raise it to {self.QUERY_MAX_LIMIT:,})"
+                        if has_geometry_rows
+                        else ""
+                    )
+                    + ". Narrow `where` (e.g. on a category field), or "
+                    "use get_distinct_values / aggregate_by_polygon for "
+                    "summaries. Do not page by OBJECTID ranges."
+                )
             caveats.append(
                 {
                     "code": "result_truncated",
@@ -737,7 +790,8 @@ class AnchorageGISPlugin(DataPlugin):
                         f"matching records (limit={limit}). The listed "
                         f"records are a SAMPLE -- do not generalize "
                         f"counts or percentages from them. Use "
-                        f"total_count for 'how many?' questions."
+                        f"total_count for 'how many?' questions. "
+                        f"{next_step}"
                     ),
                 }
             )
@@ -746,8 +800,7 @@ class AnchorageGISPlugin(DataPlugin):
                 f"{total_count:,} matching records (limit={limit}). "
                 f"The records below are a SAMPLE -- do not generalize "
                 f"counts or percentages from them. Use the TOTAL COUNT "
-                f"line below for 'how many?' questions, or narrow the "
-                f"WHERE clause to get a complete listing."
+                f"line below for 'how many?' questions. {next_step}"
             )
 
         # Single-record / small-sample caveats: fire only when
@@ -884,6 +937,7 @@ class AnchorageGISPlugin(DataPlugin):
                     "returned": len(rendered_rows),
                     "total_count": total_count,
                     "truncated": bool(truncated),
+                    "complete": bool(complete),
                 },
                 "rows": rendered_rows,
                 "caveats": caveats,
@@ -913,7 +967,24 @@ class AnchorageGISPlugin(DataPlugin):
         lines = list(provenance)
         if provenance:
             lines.append("")
-        lines.append(f"Returned {count_part} record(s) (limit: {limit}).")
+        if complete:
+            # Say it in so many words: a model that is not told a result
+            # is whole tends to go looking for the rest.
+            lines.append(
+                f"All {len(records):,} of {total_count:,} rows returned "
+                f"-- complete, no paging needed."
+            )
+            if auto_expanded_from is not None:
+                lines.append(
+                    f"(This result has at most "
+                    f"{self.SMALL_TABLE_ROW_THRESHOLD} rows, so the "
+                    f"default limit of {auto_expanded_from} was lifted to "
+                    f"return it whole.)"
+                )
+        else:
+            lines.append(
+                f"Returned {count_part} record(s) (limit: {limit})."
+            )
         if total_count is not None:
             lines.append(
                 f"TOTAL COUNT (records matching the WHERE clause): "
@@ -7412,6 +7483,14 @@ class AnchorageGISPlugin(DataPlugin):
                             "counts or percentages."
                         ),
                     },
+                    "complete": {
+                        "type": "boolean",
+                        "description": (
+                            "True when `rows` holds EVERY matching "
+                            "record (returned == total_count): no "
+                            "paging or follow-up call is needed."
+                        ),
+                    },
                 },
             },
             "rows": {
@@ -8633,8 +8712,11 @@ class AnchorageGISPlugin(DataPlugin):
                     f"read the 'TOTAL COUNT' line. LISTING: set "
                     f"`limit` to how many records you want and "
                     f"optional `where` to filter (default 1=1 = all). "
-                    f"Item must be a Feature/Map Service (not a Web "
-                    f"Map or app)."
+                    f"Omit `limit` to read a small table whole: up to "
+                    f"{self.SMALL_TABLE_ROW_THRESHOLD} matching rows "
+                    f"come back complete in ONE call -- never page by "
+                    f"OBJECTID ranges. Item must be a Feature/Map "
+                    f"Service (not a Web Map or app)."
                 ),
                 input_schema={
                     "type": "object",
@@ -8658,10 +8740,18 @@ class AnchorageGISPlugin(DataPlugin):
                         "limit": {
                             "type": "integer",
                             "description": (
-                                "Maximum number of records (default 25). "
-                                "Raise to 100+ for full listings."
+                                "Maximum number of records. Omitted: 25, "
+                                "or EVERY row when at most "
+                                f"{self.SMALL_TABLE_ROW_THRESHOLD} match "
+                                "(the response then says 'complete'). "
+                                "Set it explicitly to cap the rows (1 "
+                                "for a count); up to 1000 per call."
                             ),
-                            "default": 25,
+                            # No "default" key on purpose: the effective
+                            # default is conditional (25, or the whole
+                            # small table), and a client that pre-fills
+                            # schema defaults would send limit=25 and
+                            # switch the small-table rule off.
                             "minimum": 1,
                             "maximum": 1000,
                         },
@@ -9560,12 +9650,26 @@ class AnchorageGISPlugin(DataPlugin):
                 return_geometry = bool(
                     arguments.get("return_geometry", False)
                 )
+                # An omitted limit opts into the small-table rule below;
+                # an explicit one is honoured. (An explicit null is still
+                # rejected by _int_arg, as before.)
+                limit_given = "limit" in arguments
                 requested_limit = self._int_arg(arguments, "limit", 25)
                 effective_limit = (
                     min(requested_limit, self.GEOMETRY_LIMIT_CAP)
                     if return_geometry
                     else requested_limit
                 )
+                # Small-table rule: fetch up to the threshold in the SAME
+                # parallel round-trip as the count, so a small table can
+                # come back whole without a second request. Rows past the
+                # default are trimmed again below when the table turns
+                # out to be large. Geometry keeps its own 50-row cap.
+                fetch_limit = effective_limit
+                if not limit_given and not return_geometry:
+                    fetch_limit = max(
+                        effective_limit, self.SMALL_TABLE_ROW_THRESHOLD
+                    )
                 filters = {
                     "where": where,
                     "out_fields": out_fields,
@@ -9604,7 +9708,7 @@ class AnchorageGISPlugin(DataPlugin):
                     self.query_data(
                         item_id,
                         filters,
-                        effective_limit,
+                        fetch_limit,
                         return_geometry=return_geometry,
                     ),
                     self._get_record_count(service_url, validated_where),
@@ -9613,6 +9717,21 @@ class AnchorageGISPlugin(DataPlugin):
                 results = await asyncio.gather(*parallel_tasks)
                 records = results[0]
                 total_count = results[1]
+                auto_expanded_from: Optional[int] = None
+                if fetch_limit > effective_limit:
+                    if (
+                        total_count is not None
+                        and total_count <= self.SMALL_TABLE_ROW_THRESHOLD
+                        and len(records) > effective_limit
+                    ):
+                        # Small table: keep every row, and report the
+                        # limit actually used.
+                        auto_expanded_from = effective_limit
+                        effective_limit = fetch_limit
+                    else:
+                        # Large (or uncounted) result: the default
+                        # behaviour, exactly as before the over-fetch.
+                        records = records[:effective_limit]
                 # NOTE: f=geojson does NOT render dates as ISO strings
                 # on MOA hosted services (verified live: epoch ms in
                 # GeoJSON properties), so the conversion applies to the
@@ -9647,6 +9766,7 @@ class AnchorageGISPlugin(DataPlugin):
                     ),
                     last_edit_date=quick_meta.get("last_edit_date"),
                     coverage_pct=quick_meta.get("coverage_pct"),
+                    auto_expanded_from=auto_expanded_from,
                 )
                 if not records:
                     text += self._no_data_hint(where)
