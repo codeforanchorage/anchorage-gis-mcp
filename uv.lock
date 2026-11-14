@@ -1049,6 +1049,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "httpx" },
+    { name = "opencontext-core" },
     { name = "pyclipper" },
     { name = "pydantic" },
     { name = "python-json-logger" },
@@ -1073,6 +1074,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.14.5" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.0.0" },
+    { name = "opencontext-core", git = "https://github.com/codeforanchorage/opencontext-core?rev=v1.0.0" },
     { name = "pip-audit", marker = "extra == 'dev'", specifier = ">=2.0.0" },
     { name = "pyclipper", specifier = ">=1.4.0" },
     { name = "pydantic", specifier = ">=2.14.3" },
@@ -1087,6 +1089,16 @@ requires-dist = [
     { name = "tenacity", specifier = ">=9.2.1" },
 ]
 provides-extras = ["dev"]
+
+[[package]]
+name = "opencontext-core"
+version = "1.0.0"
+source = { git = "https://github.com/codeforanchorage/opencontext-core?rev=v1.0.0#691bc7af0407bd3d97363543a8bab3536b3795f5" }
+dependencies = [
+    { name = "pydantic" },
+    { name = "python-json-logger" },
+    { name = "pyyaml" },
+]
 
 [[package]]
 name = "packageurl-python"

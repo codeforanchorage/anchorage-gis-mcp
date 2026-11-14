@@ -23,11 +23,11 @@ python3 -c "from core.validators import load_and_validate_config; load_and_valid
 uv run pytest tests/ -n auto                                    # All tests, parallel
 uv run pytest tests/test_ckan_plugin.py -v                      # Single file
 uv run pytest tests/test_ckan_plugin.py::TestClass::test_name -v  # Single test
-uv run pytest tests/ --cov=core --cov=plugins --cov-report=term-missing  # With coverage (80% minimum)
+uv run pytest tests/ --cov=plugins --cov-report=term-missing  # With coverage (80% minimum)
 
 # Linting (ruff)
-uv run ruff check core/ plugins/ server/ tests/      # Check
-uv run ruff check core/ plugins/ server/ tests/ --fix # Auto-fix
+uv run ruff check plugins/ tests/      # Check
+uv run ruff check plugins/ tests/ --fix # Auto-fix
 # Do NOT run `ruff format` across the repo. The source is hand-wrapped to
 # ~79 cols and is not format-clean; a wholesale run produces a diff
 # thousands of lines long that buries real changes. `ruff check` is the bar.
@@ -45,6 +45,8 @@ cd client && make build
 ## Architecture
 
 **Core rule: One Fork = One MCP Server.** Each deployment runs exactly ONE plugin. This is enforced at config validation time (`core/validators.py`) and at runtime (`PluginManager.load_plugins()`). To deploy multiple MCP servers, fork the repo per plugin.
+
+**The MCP server core is a dependency, not code in this repo.** `core/` and `server/` come from the [`opencontext-core`](https://github.com/codeforanchorage/opencontext-core) package, pinned to a tag in `requirements.txt` and `pyproject.toml` (keep the two in step; `tests/test_core_dependency.py` checks). To change protocol or transport behaviour, change it there, tag a release, and move the pin here. Do not re-create `core/` or `server/` in this repo: a local copy shadows the package. `scripts/deploy.sh` installs the package next to `plugins/` in the Lambda zip, so the handler string is unchanged. To work on both at once: `pip install -e ../../opencontext-core`. Run commands from the repo root, which is where the installed core looks for `plugins/`.
 
 **Request flow:**
 ```
@@ -76,13 +78,13 @@ New plugins must implement `MCPPlugin` (or `DataPlugin` for data sources). Place
 
 Copy `config-example.yaml` to `config.yaml`. Enable exactly one plugin. Config does **NOT** support `${ENV_VAR}` substitution: `core/validators.py::load_and_validate_config` is a plain `yaml.safe_load`, so a `${VAR}` reaches the plugin as that literal string. Read secrets from `os.environ` in the plugin's `initialize()` instead, and never put one in `config.yaml` -- it is deployed with the Lambda.
 
-**`core/` and `server/` are deployment-neutral** — they are the files every OpenContext fork shares, and are being prepared to move into one shared package. Nothing specific to Anchorage GIS belongs in them; per-deployment behaviour comes from `config.yaml`:
+**The core is deployment-neutral** — it is shared by every OpenContext server, so nothing specific to Anchorage GIS belongs in it; per-deployment behaviour comes from `config.yaml`:
 
 - `server_mcp_paths` — the request paths the handler serves (default `["/mcp"]`). This deployment lists `/mcp-gcc` too; dropping it 404s the GCC Copilot connector, and `tests/test_deployment_config.py` pins it to `enable_gcc_route` in `prod.tfvars`.
 - `server_allowed_origins` — the complete browser-origin allowlist (replaces the defaults in `core/validators.py`; first entry is the default CORS origin). Unset here, so the defaults apply.
 - `instructions` — wins over the plugin's own `MCPPlugin.get_instructions()`, which is the fallback when config sets none.
 
-Plugins are found under `core.plugin_manager.plugin_root()`: `$OPENCONTEXT_PLUGIN_ROOT`, else the directory `core/` sits in when `plugins/` is there too (this repo, and the Lambda zip), else `$LAMBDA_TASK_ROOT` / the current directory (core installed as a dependency).
+Plugins are found under `core.plugin_manager.plugin_root()`: `$OPENCONTEXT_PLUGIN_ROOT`, else the directory `core/` sits in when `plugins/` is there too (the Lambda zip), else `$LAMBDA_TASK_ROOT` / the current directory (local development, where core is in site-packages).
 
 **On Lambda, `config.yaml` ships INSIDE the deployment zip** — `scripts/deploy.sh` copies it into the package and `http_handler.py` reads it from `$LAMBDA_TASK_ROOT` at runtime. Terraform deliberately sets `OPENCONTEXT_CONFIG = ""`. The env var is still honoured when non-empty, but it must stay empty: AWS caps total Lambda env-var size at 4KB, and serialising the config there broke `terraform apply` once the `instructions` block grew past ~3KB. Do not move config back into it, and keep other env vars small.
 
