@@ -5,6 +5,12 @@ server_website_url: "https://github.com/codeforanchorage/anchorage-gis-mcp"
 description: "Municipality of Anchorage GIS MCP server - Safe, conversational access to Anchorage GIS maps, apps, and spatial data"
 organization: "Municipality of Anchorage"
 
+# MCP routes served; /mcp-gcc is the hardened GCC Copilot route. See
+# config.yaml for the rationale. Keep in sync with config.yaml.
+server_mcp_paths:
+  - "/mcp"
+  - "/mcp-gcc"
+
 # Per-deployment guidance returned in the MCP `initialize` response. Applies to
 # EVERY consumer (Claude on the public /mcp route, and any Copilot/GCC
 # connector if added) -- the text is model-agnostic. Pushes the model to

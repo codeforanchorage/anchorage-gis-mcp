@@ -28,6 +28,30 @@ server_name: "Your Organization OpenData MCP" # e.g., "Boston OpenData MCP"
 description: "Your organization's open data MCP server - Safe, conversational access to your open data"
 organization: "Your Organization Name" # e.g., "City of Boston"
 
+# Optional HTTP settings. Leave them out to get the defaults shown.
+#
+# Request paths served as MCP routes. List a second path only if your API
+# gateway actually routes it to this server (e.g. an API-key-guarded route).
+# server_mcp_paths:
+#   - "/mcp"
+#
+# Browser origins allowed to call the server cross-origin. This is the
+# COMPLETE allowlist -- it replaces the defaults, it does not add to them --
+# and the first entry is the origin sent on CORS responses by default.
+# Native MCP clients send no Origin header and are never affected.
+# server_allowed_origins:
+#   - "https://claude.ai"
+#   - "https://claude.com"
+#   - "https://console.anthropic.com"
+#   - "http://localhost:6274"
+#   - "http://127.0.0.1:6274"
+#
+# Optional guidance text returned to clients as the MCP `instructions`
+# field. When unset, the enabled plugin's own get_instructions() is used,
+# if it provides any.
+# instructions: |
+#   Start with search_datasets, then ...
+
 # Plugin configuration
 # ====================
 #

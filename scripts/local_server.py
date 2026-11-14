@@ -18,7 +18,10 @@ import yaml  # noqa: E402
 from aiohttp import web  # noqa: E402
 
 from core.logging_utils import configure_json_logging  # noqa: E402
-from core.validators import get_logging_config  # noqa: E402
+from core.validators import (  # noqa: E402
+    get_http_settings,
+    get_logging_config,
+)
 from server import http_handler  # noqa: E402
 from server.http_handler import UniversalHTTPHandler  # noqa: E402
 
@@ -148,14 +151,14 @@ async def start_server():
     await init_server()
 
     app = web.Application()
-    app.router.add_post("/mcp", handle_mcp_request)
-    app.router.add_options("/mcp", handle_mcp_options)
-    # The hardened GCC route shares this handler in prod; serving
-    # it here too keeps the local surface identical. Its API-key
-    # requirement is enforced at API Gateway, so locally it
-    # behaves like /mcp.
-    app.router.add_post("/mcp-gcc", handle_mcp_request)
-    app.router.add_options("/mcp-gcc", handle_mcp_options)
+    # Serve exactly the routes the deployment's config declares
+    # (`server_mcp_paths`, default just /mcp), so the local surface
+    # matches prod. Anything a gateway enforces on a route in prod (an
+    # API key, say) is not reproduced here: locally every route behaves
+    # like /mcp.
+    for mcp_path in get_http_settings(config)["mcp_paths"]:
+        app.router.add_post(mcp_path, handle_mcp_request)
+        app.router.add_options(mcp_path, handle_mcp_options)
 
     runner = web.AppRunner(app)
     await runner.setup()

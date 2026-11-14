@@ -98,6 +98,96 @@ def validate_config_structure(config: Dict[str, Any]) -> None:
         raise ConfigurationError("'plugins' section must be a dictionary")
 
 
+# Browser origins allowed to call the MCP route cross-origin when a
+# deployment does not set `server_allowed_origins`. Native MCP clients
+# send no Origin header at all, so this list never affects them.
+DEFAULT_ALLOWED_ORIGINS: Tuple[str, ...] = (
+    "https://claude.ai",
+    "https://claude.com",
+    "https://console.anthropic.com",
+    "http://localhost:6274",
+    "http://127.0.0.1:6274",
+)
+
+# Request paths that carry MCP JSON-RPC when a deployment does not set
+# `server_mcp_paths`.
+DEFAULT_MCP_PATHS: Tuple[str, ...] = ("/mcp",)
+
+
+def _string_list(config: Dict[str, Any], key: str) -> List[str]:
+    """Read an optional non-empty list of non-empty strings from config."""
+    value = config.get(key)
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(isinstance(item, str) and item.strip() for item in value)
+    ):
+        raise ConfigurationError(
+            f"'{key}' must be a non-empty list of strings, got {value!r}"
+        )
+    return [item.strip() for item in value]
+
+
+def get_http_settings(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve the per-deployment HTTP settings, applying defaults.
+
+    Two optional top-level config keys:
+
+    * ``server_allowed_origins`` -- the COMPLETE browser-origin allowlist
+      (it replaces the default list rather than extending it, so what is
+      allowed is exactly what the config says). The first entry is the
+      origin sent on CORS responses to callers with no allowlisted
+      Origin.
+    * ``server_mcp_paths`` -- the request paths served as MCP routes.
+      A deployment exposing a second route on the same handler (for
+      example one that API Gateway guards with an API key) lists it
+      here.
+
+    Args:
+        config: Parsed configuration dictionary
+
+    Returns:
+        Dict with ``allowed_origins`` (frozenset), ``default_cors_origin``
+        (str) and ``mcp_paths`` (tuple, in configured order)
+
+    Raises:
+        ConfigurationError: If either key is present but malformed
+    """
+    if not isinstance(config, dict):
+        raise ConfigurationError("Configuration must be a YAML dictionary")
+
+    if config.get("server_allowed_origins") is None:
+        origins = list(DEFAULT_ALLOWED_ORIGINS)
+    else:
+        origins = _string_list(config, "server_allowed_origins")
+        for origin in origins:
+            if not origin.startswith(("http://", "https://")) or origin.endswith(
+                "/"
+            ):
+                raise ConfigurationError(
+                    "'server_allowed_origins' entries must be origins such "
+                    f"as 'https://example.org' (scheme, no trailing slash), "
+                    f"got {origin!r}"
+                )
+
+    if config.get("server_mcp_paths") is None:
+        paths = list(DEFAULT_MCP_PATHS)
+    else:
+        paths = _string_list(config, "server_mcp_paths")
+        for path in paths:
+            if not path.startswith("/"):
+                raise ConfigurationError(
+                    f"'server_mcp_paths' entries must start with '/', "
+                    f"got {path!r}"
+                )
+
+    return {
+        "allowed_origins": frozenset(origins),
+        "default_cors_origin": origins[0],
+        "mcp_paths": tuple(dict.fromkeys(paths)),
+    }
+
+
 def load_and_validate_config(config_path: str = "config.yaml") -> Dict[str, Any]:
     """Load and validate configuration from YAML file.
 
@@ -130,6 +220,10 @@ def load_and_validate_config(config_path: str = "config.yaml") -> Dict[str, Any]
 
     # Validate plugin count (CRITICAL)
     enabled_plugins, count = validate_plugin_count(config)
+
+    # Fail at load time, not on the first request, if the optional HTTP
+    # settings are malformed.
+    get_http_settings(config)
 
     logger.info(
         f"Configuration validated: {count} plugin(s) enabled: {', '.join(enabled_plugins)}"

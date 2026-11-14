@@ -33,8 +33,10 @@ def reset_http_handler_globals():
 
     saved_plugin_manager = http_handler._plugin_manager
     saved_mcp_server = http_handler._mcp_server
+    saved_config = http_handler._config
     try:
         yield
     finally:
         http_handler._plugin_manager = saved_plugin_manager
         http_handler._mcp_server = saved_mcp_server
+        http_handler._config = saved_config

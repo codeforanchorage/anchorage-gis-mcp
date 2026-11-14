@@ -47,10 +47,18 @@ class TestPathValidation:
     @pytest.mark.asyncio
     async def test_valid_path_mcp_gcc_succeeds(self):
         """The hardened GCC route shares this handler and must be accepted
-        (its API-key requirement is enforced upstream at API Gateway)."""
+        (its API-key requirement is enforced upstream at API Gateway).
+        It is served because the deployment's config lists it."""
         handler = UniversalHTTPHandler()
 
         with (
+            patch(
+                "server.http_handler._load_config",
+                return_value={
+                    "plugins": {"anchorage_gis": {"enabled": True}},
+                    "server_mcp_paths": ["/mcp", "/mcp-gcc"],
+                },
+            ),
             patch("server.http_handler._initialize_server") as mock_init,
             patch("server.http_handler._mcp_server") as mock_mcp_server,
         ):

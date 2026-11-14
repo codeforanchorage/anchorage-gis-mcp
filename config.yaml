@@ -5,6 +5,15 @@ server_website_url: "https://github.com/codeforanchorage/anchorage-gis-mcp"
 description: "Municipality of Anchorage GIS MCP server - Safe, conversational access to Anchorage GIS maps, apps, and spatial data"
 organization: "Municipality of Anchorage"
 
+# Request paths the handler serves as MCP routes. /mcp-gcc is the hardened
+# M365 GCC Copilot route (terraform: enable_gcc_route = true); its API-key
+# requirement is enforced at API Gateway, the handler only has to accept the
+# path. REMOVING IT HERE 404s THE COPILOT CONNECTOR even though the gateway
+# route still exists -- tests/test_deployment_config.py pins the two together.
+server_mcp_paths:
+  - "/mcp"
+  - "/mcp-gcc"
+
 # Per-deployment guidance returned in the MCP `initialize` response
 # (server-level `instructions`). Steers model behavior WITHOUT editing tool
 # descriptions. Applies to EVERY consumer of this server (Claude on the public

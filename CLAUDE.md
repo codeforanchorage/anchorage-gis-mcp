@@ -76,6 +76,14 @@ New plugins must implement `MCPPlugin` (or `DataPlugin` for data sources). Place
 
 Copy `config-example.yaml` to `config.yaml`. Enable exactly one plugin. Config does **NOT** support `${ENV_VAR}` substitution: `core/validators.py::load_and_validate_config` is a plain `yaml.safe_load`, so a `${VAR}` reaches the plugin as that literal string. Read secrets from `os.environ` in the plugin's `initialize()` instead, and never put one in `config.yaml` -- it is deployed with the Lambda.
 
+**`core/` and `server/` are deployment-neutral** — they are the files every OpenContext fork shares, and are being prepared to move into one shared package. Nothing specific to Anchorage GIS belongs in them; per-deployment behaviour comes from `config.yaml`:
+
+- `server_mcp_paths` — the request paths the handler serves (default `["/mcp"]`). This deployment lists `/mcp-gcc` too; dropping it 404s the GCC Copilot connector, and `tests/test_deployment_config.py` pins it to `enable_gcc_route` in `prod.tfvars`.
+- `server_allowed_origins` — the complete browser-origin allowlist (replaces the defaults in `core/validators.py`; first entry is the default CORS origin). Unset here, so the defaults apply.
+- `instructions` — wins over the plugin's own `MCPPlugin.get_instructions()`, which is the fallback when config sets none.
+
+Plugins are found under `core.plugin_manager.plugin_root()`: `$OPENCONTEXT_PLUGIN_ROOT`, else the directory `core/` sits in when `plugins/` is there too (this repo, and the Lambda zip), else `$LAMBDA_TASK_ROOT` / the current directory (core installed as a dependency).
+
 **On Lambda, `config.yaml` ships INSIDE the deployment zip** — `scripts/deploy.sh` copies it into the package and `http_handler.py` reads it from `$LAMBDA_TASK_ROOT` at runtime. Terraform deliberately sets `OPENCONTEXT_CONFIG = ""`. The env var is still honoured when non-empty, but it must stay empty: AWS caps total Lambda env-var size at 4KB, and serialising the config there broke `terraform apply` once the `instructions` block grew past ~3KB. Do not move config back into it, and keep other env vars small.
 
 Two AWS sizing values are read from `config.yaml` in preference to `terraform/aws/prod.tfvars` — `lambda_memory` and `lambda_timeout` (see the `locals` block in `terraform/aws/main.tf`). Editing them in the tfvars alone silently does nothing. `lambda_name` uses the opposite precedence, so check `main.tf` per variable rather than assuming.

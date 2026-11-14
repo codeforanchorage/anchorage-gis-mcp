@@ -19,7 +19,10 @@ from core.logging_utils import (
 from core.mcp_server import ERA_MODERN, MCPServer
 from core.plugin_manager import PluginManager
 from core.validators import (
+    DEFAULT_ALLOWED_ORIGINS,
+    DEFAULT_MCP_PATHS,
     ConfigurationError,
+    get_http_settings,
     get_logging_config,
     load_and_validate_config,
 )
@@ -138,34 +141,53 @@ async def _initialize_server() -> None:
 class UniversalHTTPHandler:
     """Universal HTTP handler for cloud-agnostic request processing."""
 
-    # Browser origins allowed to call /mcp via cross-origin requests.
-    # Native MCP clients (Claude Desktop, Claude Code, server-side
-    # integrations) do not enforce CORS, so they are unaffected by this
-    # list. Add real consumers here as they show up in CloudWatch.
-    ALLOWED_ORIGINS = frozenset(
-        {
-            "https://claude.ai",
-            "https://claude.com",
-            "https://console.anthropic.com",
-            "http://localhost:6274",
-            "http://127.0.0.1:6274",
-        }
-    )
-    # Default origin returned when no Origin header is sent or the
-    # caller's origin is not on the allowlist. claude.ai is the primary
-    # legitimate browser consumer today; reflecting it ensures the most
-    # common case keeps working without a request-header round-trip.
-    DEFAULT_CORS_ORIGIN = "https://claude.ai"
+    # The three attributes below are the DEFAULTS, used when the
+    # deployment's config does not say otherwise. A deployment overrides
+    # them with `server_allowed_origins` / `server_mcp_paths` in
+    # config.yaml (see core.validators.get_http_settings) -- never by
+    # editing this file, which is shared by every server.
+    #
+    # Browser origins allowed to call the MCP route cross-origin. Native
+    # MCP clients (Claude Desktop, Claude Code, server-side integrations)
+    # send no Origin and do not enforce CORS, so they are unaffected.
+    ALLOWED_ORIGINS = frozenset(DEFAULT_ALLOWED_ORIGINS)
+    # Origin returned when no Origin header is sent or the caller's origin
+    # is not on the allowlist: the first allowlisted origin, so the most
+    # common browser consumer keeps working without a request-header
+    # round-trip.
+    DEFAULT_CORS_ORIGIN = DEFAULT_ALLOWED_ORIGINS[0]
 
-    # Request paths that carry MCP JSON-RPC. The hardened GCC route
-    # (/mcp-gcc) shares this same Lambda handler as the public /mcp route;
-    # its API-key requirement is enforced at API Gateway, not here, so the
-    # handler simply needs to accept the path.
-    MCP_PATHS = frozenset({"/mcp", "/mcp-gcc"})
+    # Request paths that carry MCP JSON-RPC. A deployment can serve more
+    # than one route from this handler (say, a second one that the
+    # gateway guards with an API key); authentication is the gateway's
+    # concern, so the handler only needs to accept the path.
+    MCP_PATHS = DEFAULT_MCP_PATHS
 
     def __init__(self) -> None:
         """Initialize the universal HTTP handler."""
         logger.info("UniversalHTTPHandler initialized")
+
+    @classmethod
+    def _http_settings(cls) -> Dict[str, Any]:
+        """Allowed origins and MCP paths for this deployment.
+
+        Read from the deployment config on every call (the config itself
+        is cached, so this is a couple of dict lookups). These checks run
+        BEFORE the server is initialized, so a config that cannot be
+        loaded must not turn an Origin refusal or a 404 into a crash: in
+        that case the class defaults apply, and the request goes on to
+        fail with the usual 500 when initialization hits the same error.
+        A config that loads but carries malformed settings never gets
+        this far -- load_and_validate_config rejects it.
+        """
+        try:
+            return get_http_settings(_load_config())
+        except Exception:
+            return {
+                "allowed_origins": cls.ALLOWED_ORIGINS,
+                "default_cors_origin": cls.DEFAULT_CORS_ORIGIN,
+                "mcp_paths": tuple(cls.MCP_PATHS),
+            }
 
     @classmethod
     def _get_cors_headers(
@@ -177,16 +199,17 @@ class UniversalHTTPHandler:
             request_origin: The Origin header from the incoming request,
                 if any. If it matches the allowlist, it's echoed back so
                 the browser will accept the response. Otherwise the
-                default (claude.ai) is sent — non-browser clients ignore
+                default origin is sent — non-browser clients ignore
                 CORS, so they are unaffected.
 
         Returns:
             Dictionary of CORS headers.
         """
-        if request_origin and request_origin in cls.ALLOWED_ORIGINS:
+        settings = cls._http_settings()
+        if request_origin and request_origin in settings["allowed_origins"]:
             allow_origin = request_origin
         else:
-            allow_origin = cls.DEFAULT_CORS_ORIGIN
+            allow_origin = settings["default_cors_origin"]
         return {
             "Access-Control-Allow-Origin": allow_origin,
             "Vary": "Origin",
@@ -204,14 +227,14 @@ class UniversalHTTPHandler:
 
         The MCP HTTP transport requires servers to answer 403 Forbidden for
         an invalid Origin — the defence against DNS-rebinding attacks, which
-        matters here because ``/mcp`` is anonymous and CloudWatch already
-        shows it being probed.
+        matters because the MCP route is typically anonymous and gets
+        probed.
 
         Only a *present* Origin can be invalid: native MCP clients (Claude
-        Desktop, Claude Code, the claude.ai backend connector, Copilot
-        Studio, curl) send none at all, and are unaffected. A browser origin
-        that is not on the allowlist already fails CORS today — this turns a
-        confusing client-side CORS failure into an explicit server refusal.
+        Desktop, Claude Code, server-side connectors, curl) send none at
+        all, and are unaffected. A browser origin that is not on the
+        allowlist already fails CORS — this turns a confusing client-side
+        CORS failure into an explicit server refusal.
 
         Args:
             request_origin: The Origin header from the request, if any.
@@ -219,7 +242,10 @@ class UniversalHTTPHandler:
         Returns:
             True if the request should be rejected with 403.
         """
-        return bool(request_origin) and request_origin not in cls.ALLOWED_ORIGINS
+        return (
+            bool(request_origin)
+            and request_origin not in cls._http_settings()["allowed_origins"]
+        )
 
     async def handle_request(
         self,
@@ -281,7 +307,9 @@ class UniversalHTTPHandler:
             return (403, error_headers, error_body)
 
         # Validate path - must be an MCP route
-        if path not in self.MCP_PATHS:
+        mcp_paths = self._http_settings()["mcp_paths"]
+        if path not in mcp_paths:
+            expected = " or ".join(f"'{p}'" for p in mcp_paths)
             duration_ms = (time.perf_counter() - start_time) * 1000
             error_body = json.dumps(
                 {
@@ -290,7 +318,7 @@ class UniversalHTTPHandler:
                     "error": {
                         "code": -32601,
                         "message": "Not Found",
-                        "data": f"Path '{path}' not found. Expected '/mcp' or '/mcp-gcc'",
+                        "data": f"Path '{path}' not found. Expected {expected}",
                     },
                 }
             )

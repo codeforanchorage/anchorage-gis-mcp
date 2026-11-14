@@ -7,13 +7,53 @@ Enforces the "one fork = one MCP server" rule at runtime.
 import importlib
 import inspect
 import logging
+import os
+import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from core.interfaces import MCPPlugin, ToolResult, UnknownToolError
 from core.validators import ConfigurationError, get_enabled_plugin_config
 
 logger = logging.getLogger(__name__)
+
+# Directories, relative to the plugin root, that hold plugin packages.
+PLUGIN_DIRS = ("plugins", "custom_plugins")
+
+# Set to the directory containing plugins/ (and custom_plugins/) to say
+# explicitly where a deployment's plugins live.
+PLUGIN_ROOT_ENV = "OPENCONTEXT_PLUGIN_ROOT"
+
+
+def plugin_root() -> Path:
+    """Directory that contains ``plugins/`` and ``custom_plugins/``.
+
+    Resolved in this order:
+
+    1. ``$OPENCONTEXT_PLUGIN_ROOT``, when set.
+    2. The directory this ``core`` package sits in, when plugins are
+       there too -- the layout of a repo that vendors ``core/`` next to
+       ``plugins/``, and of the Lambda zip.
+    3. ``$LAMBDA_TASK_ROOT``, else the current directory -- the case
+       where ``core`` is an installed dependency living in site-packages
+       and the deployment's own plugins are in its project directory.
+
+    Plugins are imported as ``plugins.<name>.plugin``, so for 1 and 3 the
+    root is put on ``sys.path`` if it is not importable already.
+    """
+    override = os.environ.get(PLUGIN_ROOT_ENV)
+    if override:
+        root = Path(override)
+    else:
+        package_parent = Path(__file__).parent.parent
+        if any((package_parent / name).is_dir() for name in PLUGIN_DIRS):
+            return package_parent
+        root = Path(os.environ.get("LAMBDA_TASK_ROOT") or os.getcwd())
+
+    root_str = str(root.resolve())
+    if root_str not in sys.path:
+        sys.path.insert(0, root_str)
+    return root
 
 
 class PluginManager:
@@ -50,21 +90,14 @@ class PluginManager:
             List of tuples (plugin_name, plugin_directory_path)
         """
         discovered = []
-        base_dir = Path(__file__).parent.parent
+        base_dir = plugin_root()
 
-        # Discover built-in plugins
-        plugins_dir = base_dir / "plugins"
-        if plugins_dir.exists():
-            for plugin_dir in plugins_dir.iterdir():
-                if plugin_dir.is_dir() and not plugin_dir.name.startswith("_"):
-                    plugin_file = plugin_dir / "plugin.py"
-                    if plugin_file.exists():
-                        discovered.append((plugin_dir.name, plugin_dir))
-
-        # Discover custom plugins
-        custom_plugins_dir = base_dir / "custom_plugins"
-        if custom_plugins_dir.exists():
-            for plugin_dir in custom_plugins_dir.iterdir():
+        # Built-in plugins first, then custom plugins.
+        for dir_name in PLUGIN_DIRS:
+            plugins_dir = base_dir / dir_name
+            if not plugins_dir.exists():
+                continue
+            for plugin_dir in sorted(plugins_dir.iterdir()):
                 if plugin_dir.is_dir() and not plugin_dir.name.startswith("_"):
                     plugin_file = plugin_dir / "plugin.py"
                     if plugin_file.exists():
@@ -89,13 +122,14 @@ class PluginManager:
             ImportError: If plugin cannot be imported
             ValueError: If plugin class not found or invalid
         """
-        # Determine module path
-        if "plugins" in str(plugin_path):
-            module_path = f"plugins.{plugin_name}.plugin"
-        elif "custom_plugins" in str(plugin_path):
-            module_path = f"custom_plugins.{plugin_name}.plugin"
-        else:
+        # The package is the directory the plugin sits in. Matched on that
+        # directory's NAME, not by substring: "plugins" is a substring of
+        # "custom_plugins" (so custom plugins used to be imported from the
+        # wrong package) and of any unrelated parent directory.
+        package = Path(plugin_path).parent.name
+        if package not in PLUGIN_DIRS:
             raise ValueError(f"Invalid plugin path: {plugin_path}")
+        module_path = f"{package}.{plugin_name}.plugin"
 
         try:
             module = importlib.import_module(module_path)
@@ -263,6 +297,20 @@ class PluginManager:
                 success=False,
                 error_message=error_msg,
             )
+
+    def get_instructions(self) -> Optional[str]:
+        """Server-level instructions supplied by the loaded plugin(s).
+
+        Returns:
+            The plugins' instruction texts joined by blank lines, or None
+            when no plugin supplies any.
+        """
+        parts = []
+        for plugin in self.plugins.values():
+            text = plugin.get_instructions()
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        return "\n\n".join(parts) or None
 
     def get_all_tools(self) -> List[Dict[str, Any]]:
         """Get all registered tools with their definitions.

@@ -26,17 +26,17 @@ class ToolInputError(ValueError):
     A marker, not a behaviour change: it exists so the outer handler can
     tell "the caller asked for something invalid" from "this server
     broke", and log the first at WARNING with no traceback. A traceback
-    is a claim that the server failed; spending one on "you forgot
-    item_id" is what makes real faults hard to find.
+    is a claim that the server failed; spending one on "you forgot a
+    required argument" is what makes real faults hard to find.
 
     Deliberately NOT inferred from ValueError alone. That heuristic is
-    wrong in two ways here:
+    wrong in two ways:
       * json.JSONDecodeError subclasses ValueError, so a malformed
         upstream payload would be misfiled as a caller mistake and lose
         its stack trace.
-      * The ArcGIS wrapper raises plain ValueError for "Feature Service
-        returned non-JSON" -- a genuine upstream fault whose traceback
-        we want.
+      * Plugins raise plain ValueError for upstream faults too (an
+        upstream service answering with something that is not JSON, for
+        instance) -- genuine faults whose tracebacks we want.
     Both stay plain ValueError and keep their tracebacks.
 
     Subclasses ValueError so every existing `except ValueError` keeps
@@ -184,6 +184,18 @@ class MCPPlugin(ABC):
         - Set self._initialized = False
         """
         pass
+
+    def get_instructions(self) -> Optional[str]:
+        """Server-level guidance for the client/model, or None.
+
+        Sent as the MCP ``instructions`` field when the deployment's
+        config.yaml sets no ``instructions`` of its own -- config wins,
+        so an operator can always override the text without touching
+        plugin code. Override this when the guidance belongs with the
+        plugin (it describes the plugin's own tools) rather than with
+        one deployment of it.
+        """
+        return None
 
     @abstractmethod
     def get_tools(self) -> List[ToolDefinition]:

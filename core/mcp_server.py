@@ -424,8 +424,6 @@ class MCPServer:
         Returns:
             Initialize response
         """
-        config = self.plugin_manager.config or {}
-
         requested_version = params.get("protocolVersion")
         protocol_version = (
             requested_version
@@ -439,8 +437,8 @@ class MCPServer:
             "serverInfo": self._server_info(protocol_version),
         }
 
-        # Optional per-deployment guidance string surfaced to the client/model.
-        instructions = config.get("instructions")
+        # Optional guidance string surfaced to the client/model.
+        instructions = self._instructions()
         if instructions:
             result["instructions"] = instructions
 
@@ -509,19 +507,34 @@ class MCPServer:
         example -- a dual-era client picks the newest mutual one; a legacy
         client never calls this.
         """
-        config = self.plugin_manager.config or {}
         result: Dict[str, Any] = {
             "supportedVersions": list(self.SUPPORTED_PROTOCOL_VERSIONS),
             "capabilities": self._capabilities(),
             "ttlMs": self.DISCOVER_TTL_MS,
             "cacheScope": "public",
         }
-        instructions = config.get("instructions")
+        instructions = self._instructions()
         if instructions:
             result["instructions"] = instructions
         return result
 
     # ── Shared ────────────────────────────────────────────────────────
+
+    def _instructions(self) -> Optional[str]:
+        """Server-level ``instructions`` text, or None to omit the field.
+
+        The deployment's config.yaml wins; a plugin's own
+        ``get_instructions()`` is the fallback. Only a real string is
+        ever returned, so nothing else can reach the JSON response.
+        """
+        config = self.plugin_manager.config or {}
+        configured = config.get("instructions")
+        if isinstance(configured, str) and configured.strip():
+            return configured
+        supplied = self.plugin_manager.get_instructions()
+        if isinstance(supplied, str) and supplied.strip():
+            return supplied
+        return None
 
     # First revision whose Implementation schema defines websiteUrl.
     WEBSITE_URL_MIN_VERSION = "2025-11-25"
