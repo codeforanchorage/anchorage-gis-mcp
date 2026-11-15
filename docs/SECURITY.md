@@ -82,7 +82,7 @@ surface, and must stay in sync:
 ### Input validation
 
 - **WHERE clauses** validated against a SQL-injection denylist
-  (`plugins/arcgis/where_validator.py`). Forbidden keywords include
+  (`arcgis_hub/where_validator.py`, in the opencontext-arcgis-hub package). Forbidden keywords include
   `INSERT/UPDATE/DELETE/DROP/UNION/EXEC/...`; forbidden substrings
   include `;`, `--`, `/*`, `0x`, `xp_`, `sp_`. Max length 2000 chars.
 - **`out_fields` and `order_by`** validated for syntax via
