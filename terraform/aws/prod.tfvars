@@ -14,30 +14,33 @@ lambda_timeout  = 28
 api_quota_limit = 3000
 # Rate/burst feed BOTH the stage-wide throttle (the aggregate cap on the
 # keyless public /mcp) and the usage-plan throttle (API-key traffic).
-# Steady-state posture, restored 2026-08-23 after the ESRI UC week raise
-# (2026-07-13 .. 2026-08-23 ran at 20 / 40); see docs/RUNBOOK.md.
-api_rate_limit  = 5
-api_burst_limit = 10
+# Raised 5 / 10 -> 15 / 30 on 2026-11-17 for ~11 more attorneys onboarding
+# via Claude.ai (same sizing as eCode's c6ca0e2). Earlier postures: 5 / 10
+# steady state, 20 / 40 for the ESRI UC week; see docs/RUNBOOK.md.
+api_rate_limit  = 15
+api_burst_limit = 30
 custom_domain   = "anchorage-gis.codeforanchorage.org"
 
 # Cap concurrent Lambda executions. Cost and blast-radius protection if
-# WAF is bypassed via distributed sources. Conversational MCP traffic does
-# not need horizontal scale; raise if legitimate users start getting throttled.
-# Steady-state: 10, restored 2026-08-23 (ESRI UC week ran at 25). Bounds
-# worst-case Lambda spend to ~10 GB-s/s ~= $14/day even at full saturation.
-lambda_reserved_concurrency = 10
+# WAF is bypassed via distributed sources. Raised 10 -> 30 on 2026-11-17 for
+# ~11 more attorneys onboarding via Claude.ai; the cap of 10 was hit on
+# 2026-11-10 (8 throttles, 5xx alarm). Earlier: 10 steady state, 25 for the
+# ESRI UC week. Bounds worst-case Lambda spend to ~30 GB-s/s ~= $43/day at
+# full saturation. The Lambda Throttles alarm fires on any throttle here.
+lambda_reserved_concurrency = 30
 
 # WAF per-IP rate limit (rolling 5-minute window). The MCP tools are
 # conversational, so 1 rps sustained per IP (~300/5min) is plenty for
 # real users and tight enough to slow scrapers and denial-of-wallet probes.
 # NOTE: ALL claude.ai users share ~5 Anthropic egress IPs (160.79.106.32/27),
 # so this per-IP limit is effectively an aggregate cap on claude.ai traffic.
-# Steady-state: 300, restored 2026-08-23 (ESRI UC week ran at 600).
+# Raised 300 -> 2000 on 2026-11-17 for that reason (earlier: 300 steady
+# state, 600 for the ESRI UC week).
 # NOTE: INERT while use_shared_waf = true -- it only takes effect on a
 # rollback to a dedicated ACL. The LIVE per-IP limit lives in mcp-stats'
-# `fleet_waf_members` under key `anchorage-gis` and must be lowered to 300
-# THERE as well, or the effective WAF cap stays at 600.
-waf_rate_limit_per_5min = 300
+# `fleet_waf_members` under key `anchorage-gis` (2000 since mcp-stats
+# 26f2caa); change it THERE and keep this value in agreement.
+waf_rate_limit_per_5min = 2000
 
 # CloudWatch alarms (errors, throttles, 5xx, probing, duration) notify this
 # topic; email subscription on it. Empty string = alarms are dashboard-only.
@@ -52,7 +55,7 @@ enable_gcc_route = true
 
 # Use the fleet-wide WAF instead of a dedicated ACL for this MCP. A dedicated
 # ACL costs ~$8/mo in fixed AWS charges regardless of traffic; the shared ACL
-# keeps this MCP's 600/5min limit as its own counter, aggregated on
+# keeps this MCP's 2000/5min limit as its own counter, aggregated on
 # (IP, Host) so it stays independent of the other MCPs sharing that limit.
 #
 # The effective limit now lives in mcp-stats' `fleet_waf_members` under the key

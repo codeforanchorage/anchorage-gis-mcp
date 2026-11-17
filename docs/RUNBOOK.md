@@ -20,7 +20,7 @@ Every request now gets throttled at zero Lambda cost. Reverse it:
 # restore the terraform-managed value (see prod.tfvars)
 aws lambda put-function-concurrency \
   --function-name anchorage-gis-mcp-prod \
-  --reserved-concurrent-executions 25
+  --reserved-concurrent-executions 30
 ```
 
 Note: the CLI change drifts from Terraform state; the next
@@ -38,15 +38,17 @@ in-place):
 
 ## Traffic postures
 
-| Var | Steady state | Raised (e.g. ESRI UC week) |
-|---|---|---|
-| `api_rate_limit` | 5 | 20 |
-| `api_burst_limit` | 10 | 40 |
-| `lambda_reserved_concurrency` | 10 | 25 |
-| `waf_rate_limit_per_5min` | 300 | 600 |
+| Var | Old steady state | ESRI UC week | Attorney onboarding (current) |
+|---|---|---|---|
+| `api_rate_limit` | 5 | 20 | 15 |
+| `api_burst_limit` | 10 | 40 | 30 |
+| `lambda_reserved_concurrency` | 10 | 25 | 30 |
+| `waf_rate_limit_per_5min` | 300 | 600 | 2000 |
 
-**Current posture: STEADY STATE**, restored 2026-08-23. The ESRI UC
-raise ran 2026-07-13 .. 2026-08-23.
+**Current posture: ATTORNEY ONBOARDING**, set 2026-11-17 (same sizing as
+eCode): ~11 more attorneys arrive through Claude.ai's shared egress IPs,
+and the concurrency cap of 10 was hit on 2026-11-10. The old steady state
+ran 2026-08-23 .. 2026-11-17; the ESRI UC raise 2026-07-13 .. 2026-08-23.
 
 To change posture, edit `terraform/aws/prod.tfvars` and deploy,
 answering `yes` at the script's own confirm gate:
@@ -62,11 +64,12 @@ answering `yes` at the script's own confirm gate:
 > The value in `prod.tfvars` applies only on a rollback to a dedicated
 > ACL.
 >
-> The fleet value was lowered to 300 in mcp-stats on 2026-08-23, so the
-> live per-IP limit now matches the 300 shown above.
+> The fleet value was raised to 2000 in mcp-stats on 2026-11-17 (commit
+> 26f2caa), so the live per-IP limit matches the 2000 shown above.
 
-Worst-case cost at full 24/7 saturation: steady ≈ $17/day, UC posture
-≈ $50/day. Realistic traffic is far below both (conversational MCP is
+Worst-case cost at full 24/7 saturation: old steady state ≈ $17/day, UC
+posture ≈ $50/day; the current posture sits between the two on rps and
+slightly above UC on concurrency. Realistic traffic is far below both (conversational MCP is
 bursty, and throttles bite before spend does).
 
 Key nuance: all claude.ai users arrive via ~5 Anthropic egress IPs

@@ -27,13 +27,18 @@ should read this before changing anything in `plugins/anchorage_gis/`,
 
 ### Network and request shape
 
-- **WAF per-IP rate limit** at 300 req / 5 min, blocking mode
-  (`terraform/aws/waf.tf`).
-- **API Gateway throttling** at 5 rps / 10 burst with a 3000 req/day
-  quota (`terraform/aws/api_gateway.tf`, `prod.tfvars`).
+- **WAF per-IP rate limit** at 2000 req / 5 min, blocking mode. This
+  deployment uses the **shared fleet ACL** (`use_shared_waf = true` in
+  `prod.tfvars`); the effective limit lives in mcp-stats'
+  `fleet_waf_members` under the key `anchorage-gis`, not in this repo.
+- **API Gateway throttling** at 15 rps / 30 burst, stage-wide via
+  `aws_api_gateway_method_settings` reading `api_rate_limit` /
+  `api_burst_limit` from `prod.tfvars`. The 3000 req/day usage-plan quota
+  applies only to API-key requests (the `/mcp-gcc` route), not to the
+  unkeyed public `/mcp` route.
 - **AWS managed rule sets** (`KnownBadInputsRuleSet`,
   `CommonRuleSet`) in block mode (`waf.tf`).
-- **Lambda reserved concurrency** capped at 10 to bound cost and blast
+- **Lambda reserved concurrency** capped at 30 to bound cost and blast
   radius if WAF is bypassed (`main.tf`, `prod.tfvars`).
 - **HTTP method allowlist:** only `POST /mcp` and `OPTIONS /mcp`
   reach plugin code; `GET`/`DELETE` return 405 (`server/http_handler.py`).
