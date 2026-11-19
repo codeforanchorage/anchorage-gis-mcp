@@ -77,7 +77,9 @@ instructions: |
     format, clips buildings shared across attached/zero-lot-line rows to
     the lot line, and returns true coverage, the district's max-coverage
     cap, and the footprint headroom under it (plus the conditional 50%
-    small-lot figure). If you only have an address, first resolve it to a
+    small-lot figure in R-1 / R-1A). In R-2M, R-3, R-3A and R-4 the cap
+    depends on the dwelling type: report the cap_source caveat, which
+    names both figures. If you only have an address, first resolve it to a
     Parcel_ID (query the parcel layer on Parcel_Address). Use
     coverage_by_polygon only for BULK screening across many parcels;
     footprint_for_parcel is the accurate single-parcel answer. Report its

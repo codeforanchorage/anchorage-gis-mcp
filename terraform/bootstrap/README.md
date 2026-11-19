@@ -37,10 +37,10 @@ This creates:
 Deploy the main OpenContext stack:
 
 ```bash
-cd ../aws
-terraform init
-terraform plan -var="config_file=config.yaml"
-terraform apply
+cd ../..
+./scripts/deploy.sh -e prod
 ```
+
+Use `./scripts/deploy.sh -e prod`: it repackages the Lambda, selects the workspace and passes `prod.tfvars`. A bare `terraform plan` without `-var-file=prod.tfvars` now stops on the missing `lambda_name` / `stage_name` instead of planning against other names.
 
 Or use the deploy script from the project root: `./scripts/deploy.sh`

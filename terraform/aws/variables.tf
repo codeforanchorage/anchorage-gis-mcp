@@ -1,7 +1,8 @@
+# No default on purpose: a plan run without -var-file=prod.tfvars must
+# fail here rather than plan a rename of the live function.
 variable "lambda_name" {
   description = "Name of the Lambda function"
   type        = string
-  default     = "opencontext-mcp-server"
 }
 
 variable "aws_region" {
@@ -55,7 +56,8 @@ variable "api_burst_limit" {
 variable "stage_name" {
   description = "API Gateway stage name (e.g. prod, dev, staging)"
   type        = string
-  default     = "staging"
+  # No default on purpose (see lambda_name): a missing var-file must
+  # not plan a replacement of the live stage.
 }
 
 variable "custom_domain" {

@@ -70,15 +70,10 @@ class TestAssessorTraps:
             assert probe in b, f"banner missing: {probe}"
 
     def test_banner_is_gated_to_the_property_layer(self):
-        import inspect
-
-        # The shared dispatcher asks the deployment for a banner...
-        src = inspect.getsource(AnchorageGISPlugin._execute_tool)
-        assert "_query_result_banner" in src
         assert AnchorageGISPlugin.PROPERTY_INFO_ITEM_ID == (
             "57d6ff611f444d75a1bf2b4a1d340163"
         )
-        # ...and Anchorage answers for the property layer only.
+        # Anchorage answers for the property layer only.
         p = AnchorageGISPlugin({})
         assert (
             p._query_result_banner(AnchorageGISPlugin.PROPERTY_INFO_ITEM_ID)
@@ -87,3 +82,21 @@ class TestAssessorTraps:
         assert p._query_result_banner("0" * 32) is None
 
 
+
+    def test_banner_reaches_the_structured_channel_too(self):
+        """Clients that render structuredContent alone must see the
+        traps: the banner used to be prepended to the markdown only."""
+        p = AnchorageGISPlugin({})
+        structured = {"caveats": [{"code": "x", "message": "y"}]}
+        text = p._apply_result_banner(
+            AnchorageGISPlugin.PROPERTY_INFO_ITEM_ID, "rows", structured
+        )
+        assert text.startswith(AnchorageGISPlugin.ASSESSOR_TRAP_BANNER)
+        assert structured["caveats"][0] == {
+            "code": "layer_notes",
+            "message": AnchorageGISPlugin.ASSESSOR_TRAP_BANNER,
+        }
+        # Any other layer is left alone.
+        other = {"caveats": []}
+        assert p._apply_result_banner("0" * 32, "rows", other) == "rows"
+        assert other["caveats"] == []

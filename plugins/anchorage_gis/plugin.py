@@ -113,12 +113,18 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
 
     # ── Coverage of the municipality ─────────────────────────────────────
 
-    # Anchorage muni bbox in WGS84 (xmin, ymin, xmax, ymax). Generous
-    # envelope around Cook Inlet to Eklutna -- used for the
-    # coverage-gap devil's-advocate check, not for filtering. Exact
+    # Anchorage muni bbox in WGS84 (xmin, ymin, xmax, ymax) -- used for
+    # the coverage-gap devil's-advocate check, not for filtering. Exact
     # boundary fidelity isn't needed; the goal is to flag clearly
     # partial-coverage layers (e.g. a single neighborhood layer).
-    ANCHORAGE_BBOX_WGS84 = (-150.5, 60.5, -148.5, 61.6)
+    #
+    # Sized to the municipality-wide parcel layer
+    # (PropertyInformation_Hosted: -150.288..-148.802, 60.768..61.486,
+    # measured 2026-11-18) plus a small margin. The earlier, looser box
+    # (-150.5, 60.5, -148.5, 61.6) was 2.2x that area, so the parcel
+    # layer itself scored 48% and every query on it carried a false
+    # LIMITED COVERAGE warning.
+    ANCHORAGE_BBOX_WGS84 = (-150.3, 60.75, -148.8, 61.5)
     @classmethod
     def _anchorage_coverage_pct(cls, extent: Any) -> Optional[float]:
         # Returns (layer intersect muni) / muni-area, in [0, ~1+]. >1 if the
@@ -325,10 +331,19 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
             f"{parcel_field} IN ({quoted})"
         )
 
+        # The matched field must come back even when the caller narrows
+        # out_fields: it is what `canonical` and `matched_values` are
+        # read from. Without it a successful match reported
+        # canonical=null, which the schema reserves for "nothing matched".
+        fetch_fields = out_fields
+        if fetch_fields != "*" and parcel_field not in fetch_fields.split(
+            ","
+        ):
+            fetch_fields = f"{fetch_fields},{parcel_field}"
         params = {
             "f": "json",
             "where": where_in,
-            "outFields": out_fields,
+            "outFields": fetch_fields,
             "returnGeometry": "false",
             "resultRecordCount": str(limit),
         }
@@ -365,6 +380,26 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
                 if v is not None:
                     matched_values.add(v)
             ordered = sorted(matched_values, key=str)
+            # One parcel number can carry many rows (every unit of a
+            # condo complex shares its master number). A full page, or
+            # the server's own flag, means there may be more.
+            match_caveats: List[Dict[str, Any]] = []
+            if len(features) >= limit or data.get("exceededTransferLimit"):
+                match_caveats.append(
+                    {
+                        "code": "limit_reached",
+                        "count": len(features),
+                        "limit": limit,
+                        "message": (
+                            f"Returned {len(features)} record(s), which "
+                            f"is the limit ({limit}); more records may "
+                            f"share this parcel number (condo units, "
+                            f"lease and economic records). Do not "
+                            f"treat this as the full count -- raise "
+                            f"`limit` (max 100)."
+                        ),
+                    }
+                )
             structured = {
                 "query": query_echo,
                 "summary": {
@@ -372,37 +407,35 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
                     "matched": True,
                     "matched_values": [self._scalar(v) for v in ordered],
                     "canonical": (
-                        self._scalar(sorted(matched_values)[0])
-                        if matched_values
-                        else None
+                        self._scalar(ordered[0]) if ordered else None
                     ),
                 },
                 "rows": [
                     dict(f.get("attributes") or {}) for f in features
                 ],
-                "caveats": [],
+                "caveats": match_caveats,
             }
             lines = [
                 f"## Parcel lookup: `{parcel_id}` -> "
-                f"{len(features)} record(s) found",
+                f"{len(features)} record(s) "
+                + ("returned" if match_caveats else "found"),
                 f"**Layer:** `{item_id}`",
                 f"**Field:** `{parcel_field}`",
                 f"**Variants tried ({len(variants)}):** "
                 + ", ".join(f"`{v}`" for v in variants),
             ]
-            if matched_values:
-                canonical = sorted(matched_values)[0]
+            if ordered:
+                canonical = ordered[0]
                 lines.append(
                     "**Matched stored format(s):** "
-                    + ", ".join(
-                        f"`{v}`" for v in sorted(matched_values)
-                    )
+                    + ", ".join(f"`{v}`" for v in ordered)
                 )
                 lines.append(
                     f"**Canonical form for this layer:** "
                     f"`{canonical}` -- use this verbatim for "
                     f"follow-up queries here."
                 )
+            lines.extend(f"**Note:** {c['message']}" for c in match_caveats)
             lines.append("")
             for i, f in enumerate(features, 1):
                 attrs = f.get("attributes") or {}
@@ -548,6 +581,13 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
     # it (the eCode MCP serves the live text but is a separate connector
     # this server cannot call). R4A is intentionally absent: the table
     # sets no maximum lot coverage for it.
+    #
+    # The table sets the cap PER USE within a district. For most
+    # districts every row carries the same figure, and that figure is
+    # here. In R2M, R3, R3A and R4 the rows differ; this dict holds the
+    # "all other uses" row and LOT_COVERAGE_USE_CAPS holds the rest.
+    # Last checked against the published text 2026-11-18 (code updated
+    # 2026-11-10).
     LOT_COVERAGE_CAPS = {
         "R1": 0.40,
         "R1A": 0.40,
@@ -555,19 +595,74 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
         "R2D": 0.40,
         "R2M": 0.40,
         "R3A": 0.50,
-        "R3": 0.60,  # townhouse / multifamily districts
-        "R4": 0.60,
+        "R3": 0.60,  # multifamily / townhouse / all other uses
+        "R4": 0.60,  # multifamily / townhouse / all other uses
         "R5": 0.30,
         "R6": 0.30,
         "R7": 0.30,
         "R8": 0.05,
         "R9": 0.10,
     }
-    # Table 21.06-1 note 3: in these districts the cap rises to 50% on
-    # lots under 10,000 sqft IF the principal structure is < 16 ft tall.
-    LOT_COVERAGE_NOTE3_DISTRICTS = frozenset(
-        {"R1", "R1A", "R2A", "R2D", "R2M"}
+    # Districts whose cap depends on the dwelling type. `low_land_uses`
+    # are the assessor Land_Use values read as the low-cap dwelling
+    # types; vacant or unrecorded land also takes the low cap, because
+    # stating the higher one for a lot that turns out to hold a
+    # single-family house overstates what may be built. The assessor
+    # cannot tell a townhouse from a single-family attached dwelling,
+    # so `wording` always names both figures.
+    _SINGLE_FAMILY_LAND_USES = frozenset(
+        {
+            "Residential 1 Family",
+            "Single Family Resid. with ADU",
+            "Mobile Home on Private lot",
+        }
     )
+    _UNDETERMINED_LAND_USES = frozenset({"Residential Vacant Land"})
+    LOT_COVERAGE_USE_CAPS = {
+        "R3": {
+            "low": 0.40,
+            "low_land_uses": _SINGLE_FAMILY_LAND_USES
+            | {"Residential 2 Family"},
+            "wording": (
+                "40% for single-family (attached or detached) and "
+                "two-family dwellings; 60% for townhouse, multifamily "
+                "and all other uses"
+            ),
+        },
+        "R4": {
+            "low": 0.40,
+            "low_land_uses": _SINGLE_FAMILY_LAND_USES,
+            "wording": (
+                "40% for single-family dwellings (attached or "
+                "detached); 60% for townhouse, multifamily and all "
+                "other uses"
+            ),
+        },
+        # Townhouse is the only higher row in these two, and the
+        # assessor Land_Use cannot identify a townhouse, so the base
+        # figure always stands and the wording carries the exception.
+        "R2M": {
+            "low": 0.40,
+            "low_land_uses": frozenset(),
+            "wording": (
+                "40% for every use except townhouse dwellings, "
+                "which are 60%"
+            ),
+        },
+        "R3A": {
+            "low": 0.50,
+            "low_land_uses": frozenset(),
+            "wording": (
+                "50% for mixed-use, multifamily and all other uses; "
+                "60% for townhouse dwellings"
+            ),
+        },
+    }
+    # Table 21.06-1 note 3: on the "Residential uses" row of these
+    # districts the cap rises to 50% on lots under 10,000 sqft IF the
+    # principal structure is < 16 ft tall. The published table attaches
+    # the note to R-1 and R-1A only; the R-2 rows read a plain 40%.
+    LOT_COVERAGE_NOTE3_DISTRICTS = frozenset({"R1", "R1A"})
     LOT_COVERAGE_UNRESTRICTED = frozenset({"R4A"})
     NOTE3_LOT_SQFT = 10000.0
     NOTE3_CAP = 0.50
@@ -990,6 +1085,30 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
             )
         elif bowl_cap is not None:
             cap = bowl_cap
+            by_use = self.LOT_COVERAGE_USE_CAPS.get(base_zone)
+            if by_use is not None:
+                land_use = attrs.get("Land_Use")
+                undetermined = (
+                    not land_use
+                    or land_use in self._UNDETERMINED_LAND_USES
+                )
+                if undetermined or land_use in by_use["low_land_uses"]:
+                    cap = by_use["low"]
+                basis = (
+                    "no dwelling type is recorded for this lot, so "
+                    "the lower figure is used"
+                    if undetermined
+                    else f"chosen from the assessor land use "
+                    f"`{land_use}`"
+                )
+                cap_note = (
+                    f"in {base_zone} the cap depends on the dwelling "
+                    f"type ({by_use['wording']}). {cap:.0%} is used "
+                    f"here: {basis}. The assessor record cannot tell "
+                    f"a townhouse from a single-family attached "
+                    f"dwelling, so confirm the dwelling type before "
+                    f"relying on the cap or the headroom"
+                )
         else:
             cap_note = (
                 f"district `{zone_raw}` is not in the residential "

@@ -125,11 +125,14 @@ async def main() -> None:
         text = await run_tool(plugin, "00326477000")
         p = payload_of(text)
         in_band = 0.30 <= p.get("coverage_pct", 0) <= 0.55
-        note3_pos = p.get("headroom_if_note3_50pct", -1) > 0
+        # R2D: Table 21.06-1 attaches note 3 to R-1 / R-1A only, so the
+        # conditional 50% figure must NOT be offered here.
+        no_note3 = "headroom_if_note3_50pct" not in p
         check(
-            "3. detached case (1820 Parkside Dr, 30-55% + note-3 > 0)",
-            in_band and note3_pos,
+            "3. detached case (1820 Parkside Dr, 30-55%, no note 3)",
+            in_band and no_note3 and p.get("district_max_coverage") == 0.40,
             f"coverage={p.get('coverage_pct')} "
+            f"cap={p.get('district_max_coverage')} "
             f"note3={p.get('headroom_if_note3_50pct')}",
         )
 

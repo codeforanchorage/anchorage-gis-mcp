@@ -39,7 +39,7 @@ pre-commit run --all-files
 cd client && make build
 
 # Deploy to AWS
-./scripts/deploy.sh --environment staging
+./scripts/deploy.sh --environment prod   # prod is the only environment
 ```
 
 ## Architecture

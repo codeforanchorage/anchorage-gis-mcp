@@ -663,6 +663,18 @@ class TestFootprintForParcel:
         assert caps["R3A"] == 0.50
         assert caps["R3"] == 0.60
         assert caps["R8"] == 0.05
+        # Table 21.06-1 sets R-3 / R-4 caps per use: 40% for
+        # single-family, 60% for townhouse / multifamily / other.
+        by_use = AnchorageGISPlugin.LOT_COVERAGE_USE_CAPS
+        assert by_use["R3"]["low"] == 0.40
+        assert by_use["R4"]["low"] == 0.40
+        assert "Residential 2 Family" in by_use["R3"]["low_land_uses"]
+        assert "Residential 2 Family" not in by_use["R4"]["low_land_uses"]
+        # Note 3 is attached to the R-1 and R-1A rows only.
+        assert AnchorageGISPlugin.LOT_COVERAGE_NOTE3_DISTRICTS == {
+            "R1",
+            "R1A",
+        }
         assert "R4A" not in caps
         assert "R4A" in AnchorageGISPlugin.LOT_COVERAGE_UNRESTRICTED
 
@@ -735,13 +747,13 @@ class TestFootprintForParcel:
     @pytest.mark.asyncio
     async def test_happy_path_numbers(self, plugin):
         # 10x10m building fully inside the 20x20m lot: 100 m2 =
-        # 1,076.39 sqft on a 4,306 sqft lot -> 25.0% coverage, R2D cap
+        # 1,076.39 sqft on a 4,306 sqft lot -> 25.0% coverage, R1 cap
         # 40% -> max 1,722 sqft, headroom ~646 sqft; note 3 applies.
         text = await _fp_run(
             plugin,
             [
                 {
-                    "attributes": _fp_parcel_attrs(),
+                    "attributes": _fp_parcel_attrs(Zoning_District="R1"),
                     "geometry": {"rings": _FP_SQUARE_RINGS},
                 }
             ],
@@ -760,6 +772,68 @@ class TestFootprintForParcel:
         # note 3: 50% of 4,306 = 2,153 - 1,076 = 1,077
         assert '"headroom_if_note3_50pct": 1077' in text
         assert "Shape__Area" in text  # caveat present
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "zone,land_use,cap",
+        [
+            ("R3", "Residential 1 Family", 0.4),
+            ("R3", "Residential 2 Family", 0.4),
+            ("R3", "Apartments - Garden", 0.6),
+            ("R3", "Residential Vacant Land", 0.4),
+            ("R3", None, 0.4),
+            ("R4", "Residential 1 Family", 0.4),
+            ("R4", "Residential 2 Family", 0.6),
+            ("R4", "Fourplex", 0.6),
+            ("R2M", "Residential 1 Family", 0.4),
+            ("R3A", "Apartments - Garden", 0.5),
+        ],
+    )
+    async def test_cap_follows_the_dwelling_type(
+        self, plugin, zone, land_use, cap
+    ):
+        text = await _fp_run(
+            plugin,
+            [
+                {
+                    "attributes": _fp_parcel_attrs(
+                        Zoning_District=zone, Land_Use=land_use
+                    ),
+                    "geometry": {"rings": _FP_SQUARE_RINGS},
+                }
+            ],
+            [
+                _fp_building(
+                    [[[5, 5], [15, 5], [15, 15], [5, 15], [5, 5]]]
+                )
+            ],
+        )
+        assert f'"district_max_coverage": {cap}' in text
+        # Both figures are always named, so a reader can see the cap
+        # is conditional whichever one was applied.
+        assert "depends on the dwelling type" in text
+        assert "townhouse" in text
+        assert "headroom_if_note3_50pct" not in text
+
+    @pytest.mark.asyncio
+    async def test_note3_is_not_offered_in_r2_districts(self, plugin):
+        text = await _fp_run(
+            plugin,
+            [
+                {
+                    "attributes": _fp_parcel_attrs(Zoning_District="R2D"),
+                    "geometry": {"rings": _FP_SQUARE_RINGS},
+                }
+            ],
+            [
+                _fp_building(
+                    [[[5, 5], [15, 5], [15, 15], [5, 15], [5, 5]]]
+                )
+            ],
+        )
+        assert '"district_max_coverage": 0.4' in text
+        assert "note3" not in text
+        assert "note 3" not in text
 
     @pytest.mark.asyncio
     async def test_shared_building_clipped_to_lot(self, plugin):
@@ -875,3 +949,113 @@ class TestFootprintForParcel:
             [_fp_building([[[5, 5], [15, 5], [15, 15], [5, 15], [5, 5]]])],
         )
         assert ">15% apart" in text
+
+
+# ── municipal coverage box ─────────────────────────────────────────────
+
+
+class TestMunicipalCoverageBox:
+    """The LIMITED COVERAGE caveat must not fire on a muni-wide layer."""
+
+    def test_parcel_layer_extent_reads_as_full_coverage(self):
+        # PropertyInformation_Hosted's extent, measured 2026-11-18. The
+        # looser box this replaced scored it 48%, under the 50%
+        # threshold, so every parcel query carried a false warning.
+        pct = AnchorageGISPlugin._region_coverage_pct(
+            {
+                "xmin": -150.288,
+                "ymin": 60.768,
+                "xmax": -148.802,
+                "ymax": 61.486,
+                "spatialReference": {"wkid": 4326},
+            }
+        )
+        assert pct > 0.9
+        assert pct >= AnchorageGISPlugin.COVERAGE_THRESHOLD
+
+    def test_a_single_neighbourhood_is_still_flagged(self):
+        pct = AnchorageGISPlugin._region_coverage_pct(
+            {
+                "xmin": -149.90,
+                "ymin": 61.20,
+                "xmax": -149.85,
+                "ymax": 61.22,
+                "spatialReference": {"wkid": 4326},
+            }
+        )
+        assert pct < AnchorageGISPlugin.COVERAGE_THRESHOLD
+
+
+# ── find_parcel: what a match reports ──────────────────────────────────
+
+
+class TestFindParcelMatchReporting:
+    @pytest.fixture
+    def plugin(self, anchorage_config):
+        p = AnchorageGISPlugin(anchorage_config)
+        p.plugin_config = AnchorageGISPluginConfig(**anchorage_config)
+        return p
+
+    @staticmethod
+    async def _run(plugin, features, args, flagged=False):
+        seen = {}
+
+        async def fake_get(url, params=None, **kwargs):
+            seen.update(params or {})
+            resp = Mock()
+            resp.status_code = 200
+            resp.raise_for_status = Mock()
+            body = {"features": features}
+            if flagged:
+                body["exceededTransferLimit"] = True
+            resp.json.return_value = body
+            return resp
+
+        with patch.object(
+            plugin, "_resolve_layer_url", new_callable=AsyncMock,
+            return_value="https://example.com/Layer/0",
+        ), patch.object(
+            plugin, "_fetch_layer_meta", new_callable=AsyncMock,
+            return_value={"fields": [{"name": "Parcel_Num"}]},
+        ):
+            plugin.client = Mock()
+            plugin.client.get = fake_get
+            base = {
+                "item_id": "a" * 32,
+                "parcel_field": "Parcel_Num",
+                "parcel_id": "003-184-87",
+            }
+            base.update(args)
+            text, structured = await plugin._find_parcel(base)
+        return text, structured, seen
+
+    @pytest.mark.asyncio
+    async def test_matched_field_is_fetched_when_out_fields_omits_it(
+        self, plugin
+    ):
+        """canonical=null means "nothing matched"; a narrowed out_fields
+        used to produce it on a successful match."""
+        feats = [{"attributes": {"Parcel_Num": "00318487000", "Owner": "X"}}]
+        _, s, sent = await self._run(plugin, feats, {"out_fields": "Owner"})
+        assert sent["outFields"] == "Owner,Parcel_Num"
+        assert s["summary"]["canonical"] == "00318487000"
+        assert s["summary"]["matched_values"] == ["00318487000"]
+
+    @pytest.mark.asyncio
+    async def test_a_full_page_is_flagged_as_possibly_partial(self, plugin):
+        """Every unit of a condo complex shares the master number."""
+        feats = [
+            {"attributes": {"Parcel_Num": "00318487000", "Unit": i}}
+            for i in range(10)
+        ]
+        text, s, _ = await self._run(plugin, feats, {})
+        assert [c["code"] for c in s["caveats"]] == ["limit_reached"]
+        assert "10 record(s) returned" in text
+        assert "more records may share this parcel number" in text
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_match_carries_no_caveat(self, plugin):
+        feats = [{"attributes": {"Parcel_Num": "00318487000"}}]
+        text, s, _ = await self._run(plugin, feats, {})
+        assert s["caveats"] == []
+        assert "1 record(s) found" in text

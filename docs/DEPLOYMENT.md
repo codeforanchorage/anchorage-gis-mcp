@@ -40,11 +40,10 @@ terraform init && terraform apply
 
 Then deploy:
 
+Use `./scripts/deploy.sh -e prod`: it repackages the Lambda, selects the workspace and passes `prod.tfvars`. A bare `terraform plan` without `-var-file=prod.tfvars` now stops on the missing `lambda_name` / `stage_name` instead of planning against other names.
+
 ```bash
-cd terraform/aws
-terraform init
-terraform plan -var="config_file=config.yaml"
-terraform apply
+./scripts/deploy.sh -e prod
 ```
 
 The deploy script copies `config.yaml` into `terraform/aws/` before running Terraform. For manual runs, ensure `config.yaml` exists in the project root or pass the correct path.
@@ -96,9 +95,13 @@ aws:
 **Update:** Change code/config, run `./scripts/deploy.sh` again.
 
 **Destroy:**
+This removes the live service. Check the workspace first, and pass
+the var-file so the plan names the resources that actually exist:
+
 ```bash
 cd terraform/aws
-terraform destroy -var="config_file=config.yaml"
+terraform workspace show        # must print anchorage-gis-prod
+terraform destroy -var-file=prod.tfvars
 ```
 
 ## Cost (us-east-1)

@@ -218,6 +218,9 @@ terraform/*/lambda-deployment.zip
 **/*.tfstate.*
 terraform/*/backups/
 terraform/*/state-backup-*.json
+# A saved plan embeds the prior state in cleartext, API keys included.
+tfplan
+*.tfplan
 
 # OpenContext client binaries
 opencontext-client

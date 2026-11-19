@@ -27,9 +27,12 @@ Or deploy manually:
 ```bash
 cd aws
 terraform init
-terraform plan -var="config_file=config.yaml"
-terraform apply
+terraform workspace select anchorage-gis-prod
+terraform plan -var-file=prod.tfvars -out=tfplan
+terraform apply tfplan
 ```
+
+Use `./scripts/deploy.sh -e prod`: it repackages the Lambda, selects the workspace and passes `prod.tfvars`. A bare `terraform plan` without `-var-file=prod.tfvars` now stops on the missing `lambda_name` / `stage_name` instead of planning against other names.
 
 **Note:** The deploy script copies `config.yaml` into `terraform/aws/` before running Terraform. For manual runs from `terraform/aws/`, use `-var="config_file=../../config.yaml"` if running from project root.
 
