@@ -319,8 +319,11 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
         )
         # Always also try the literal stripped input, in case the layer
         # stores some non-canonical form we did not anticipate.
+        # Only when the input IS an id: for an id picked out of free
+        # text ("Lot 5, 003-184-87") the whole sentence is not a form
+        # any layer stores, and it was listed among the variants tried.
         literal = str(raw).strip()
-        if literal:
+        if literal and AnchorageGISPlugin._PARCEL_ALONE_RE.fullmatch(literal):
             variants.add(literal)
         return sorted(variants)
     async def _find_parcel(
@@ -1231,7 +1234,12 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
                 f"independent lot",
                 "",
                 f"**Land use:** {attrs.get('Land_Use')}{unit_txt}  |  "
-                f"**Lot_Size:** {attrs.get('Lot_Size')!r}",
+                f"**Lot size (assessor):** "
+                + (
+                    "not recorded"
+                    if attrs.get("Lot_Size") is None
+                    else f"{attrs.get('Lot_Size')!r}"
+                ),
                 "",
                 "_The assessor records no lot area for this parcel "
                 "(typical for condo units and some leases), so lot "

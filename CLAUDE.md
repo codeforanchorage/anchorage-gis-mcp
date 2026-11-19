@@ -8,10 +8,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Install dependencies (uv preferred, pip fallback)
 uv sync --extra dev                  # or: pip install -r requirements-dev.txt
 # Lambda runs python3.14 (Amazon Linux 2023; terraform/aws/main.tf runtime
-# and deploy.sh --python-version must match). deploy.sh resolves
-# requirements.txt fresh on every deploy (uv.lock is NOT used for
-# packaging). To test what prod runs:
-#   uv lock --upgrade && uv run --python 3.14 --extra dev pytest -n auto
+# and deploy.sh --python-version must match). deploy.sh installs the
+# versions in uv.lock and refuses a tree with uncommitted changes
+# (--allow-dirty overrides), so commit before deploying. To take newer
+# library versions: `uv lock --upgrade-package <name>` for runtime
+# packages, run the tests, commit uv.lock, then deploy.
 
 # Run local MCP server (no Lambda needed)
 python3 scripts/local_server.py      # Serves on http://localhost:8000/mcp

@@ -1389,3 +1389,19 @@ class TestFindParcelMatchReporting:
         text, s, _ = await self._run(plugin, feats, {})
         assert s["caveats"] == []
         assert "1 record(s) found" in text
+
+
+class TestParcelVariantLiteral:
+    """The caller's text is a variant only when it is itself an id."""
+
+    def test_plain_id_keeps_its_own_spelling(self):
+        v = AnchorageGISPlugin._normalize_parcel_variants("003 184 87")
+        assert "003 184 87" in v and "00318487" in v
+
+    def test_free_text_is_not_sent_as_a_variant(self):
+        v = AnchorageGISPlugin._normalize_parcel_variants(
+            "Lot 5 Block 12, 003-184-87"
+        )
+        assert v == [
+            "003-184-87", "003-184-87-000", "00318487", "00318487000",
+        ]
