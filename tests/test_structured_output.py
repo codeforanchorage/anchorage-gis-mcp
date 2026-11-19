@@ -234,6 +234,30 @@ class TestFootprintStructuredOutput:
         }
 
     @pytest.mark.asyncio
+    async def test_not_a_land_parcel_conforms(self, plugin):
+        """An Economic / Lease record: result null, a caveat that says so."""
+        overlay = {
+            "attributes": {
+                "Parcel_ID": "00318487000",
+                "GIS_Category": "Economic",
+                "Parcel_Address": "1607 E 27TH AVE",
+            }
+        }
+        with patch.object(
+            plugin, "_resolve_layer_url", AsyncMock(return_value="http://x/0")
+        ), patch.object(
+            plugin,
+            "_request_json_with_retry",
+            AsyncMock(side_effect=[{"features": []}, {"features": [overlay]}]),
+        ):
+            _, structured = await plugin._footprint_for_parcel(
+                {"parcel_id": "00318487000"}
+            )
+        _validate(FP_SCHEMA, structured)
+        assert structured["result"] is None
+        assert structured["caveats"][0]["code"] == "not_a_land_parcel"
+
+    @pytest.mark.asyncio
     async def test_no_independent_lot_conforms(self, plugin):
         """A condo unit with no lot area yields result: null, not a crash."""
         _, structured = await _fp_run(
@@ -366,6 +390,25 @@ class TestFindParcelStructuredOutput:
         _validate(FIND_PARCEL, structured)
         assert structured["summary"]["canonical"] == 121329
         assert structured["query"]["variants"]
+
+    @pytest.mark.asyncio
+    async def test_base_number_match_conforms(self, plugin):
+        """11-digit miss, then the base number matches."""
+        self._patch(
+            plugin,
+            {"features": []},
+            {"features": [{"attributes": {"Parcel_Num": "00121329"}}]},
+        )
+        _, structured = await plugin._find_parcel(
+            {
+                "item_id": "a" * 32,
+                "parcel_field": "Parcel_Num",
+                "parcel_id": "001-213-29-004",
+            }
+        )
+        _validate(FIND_PARCEL, structured)
+        assert structured["summary"]["matched"] is True
+        assert structured["caveats"][0]["code"] == "base_number_match"
 
     @pytest.mark.asyncio
     async def test_miss_without_candidates_conforms(self, plugin):

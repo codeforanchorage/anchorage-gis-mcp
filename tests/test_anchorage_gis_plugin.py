@@ -366,6 +366,9 @@ class TestFindParcelCandidates:
 
     async def _miss(self, plugin, second, parcel_id="003-184-87"):
         effects = [self._resp({"features": []})]
+        if len(AnchorageGISPlugin._parcel_digits(parcel_id) or "") >= 9:
+            # An 11-digit number is tried alone, then by its base.
+            effects.append(self._resp({"features": []}))
         if second is not None:
             effects.append(
                 second
@@ -398,7 +401,7 @@ class TestFindParcelCandidates:
         await self._miss(
             plugin, {"features": []}, parcel_id="Parcel 003-184-87-001"
         )
-        where = plugin._send.await_args_list[1].kwargs["params"]["where"]
+        where = plugin._send.await_args_list[-1].kwargs["params"]["where"]
         assert "'%318487%'" in where and "001" not in where
 
     @pytest.mark.asyncio
@@ -467,6 +470,161 @@ class TestFindParcelCandidates:
                 }
             )
         plugin._send.assert_not_called()
+
+
+class TestFindParcelSubParcel:
+    """An 11-digit number names one record; a base number, all of them."""
+
+    @pytest.fixture
+    def plugin(self, anchorage_config):
+        p = AnchorageGISPlugin(anchorage_config)
+        p.plugin_config = AnchorageGISPluginConfig(**anchorage_config)
+        p._resolve_layer_url = AsyncMock(return_value="https://x/0")
+        return p
+
+    def _serve(self, plugin, field, stored):
+        """Answer IN lookups from `stored`, the values the field holds."""
+        plugin._fetch_layer_meta = AsyncMock(
+            return_value={"fields": [{"name": field}]}
+        )
+        wheres = []
+
+        async def fake_send(method, url, params=None, **kw):
+            where = params["where"]
+            wheres.append(where)
+            r = Mock()
+            r.status_code = 200
+            r.raise_for_status = Mock()
+            r.json.return_value = {
+                "features": [
+                    {"attributes": {field: v}}
+                    for v in stored
+                    if f"'{v}'" in where
+                ]
+            }
+            return r
+
+        plugin._send = fake_send
+        return wheres
+
+    async def _find(self, plugin, field, parcel_id):
+        return await plugin._find_parcel(
+            {
+                "item_id": "a" * 32,
+                "parcel_field": field,
+                "parcel_id": parcel_id,
+                "limit": 50,
+            }
+        )
+
+    UNITS11 = [f"012182040{i:02d}" for i in range(1, 4)]
+
+    @pytest.mark.asyncio
+    async def test_unit_on_an_11_digit_field_is_that_unit(self, plugin):
+        wheres = self._serve(plugin, "Parcel_ID", self.UNITS11)
+        text, s = await self._find(plugin, "Parcel_ID", "012-182-04-002")
+        assert s["summary"]["matched_values"] == ["01218204002"]
+        assert s["caveats"] == []
+        assert len(wheres) == 1 and "'01218204'" not in wheres[0]
+
+    @pytest.mark.asyncio
+    async def test_unit_on_an_8_digit_field_says_base_only(self, plugin):
+        # The field cannot tell units apart: every row is the base.
+        self._serve(plugin, "GIS_ParcelNum8", ["01218204"] * 3)
+        text, s = await self._find(plugin, "GIS_ParcelNum8", "012-182-04-002")
+        assert s["summary"]["returned"] == 3
+        (caveat,) = s["caveats"]
+        assert caveat["code"] == "base_number_match"
+        assert "not the sub-parcel `002`" in caveat["message"]
+        assert "matched on the base number, not the sub-parcel" in text
+        assert "11-digit field" in text
+
+    @pytest.mark.asyncio
+    async def test_missing_sub_parcel_says_base_only(self, plugin):
+        self._serve(plugin, "Parcel_Num", ["00215132"])
+        _, s = await self._find(plugin, "Parcel_Num", "002-151-32-999")
+        assert [c["code"] for c in s["caveats"]] == ["base_number_match"]
+
+    @pytest.mark.asyncio
+    async def test_sub_000_under_its_base_is_not_flagged(self, plugin):
+        # 00215132000 IS parcel 002-151-32; an 8-digit field holding it
+        # as 00215132 has found the parcel asked for.
+        wheres = self._serve(plugin, "GIS_ParcelNum8", ["00215132"])
+        text, s = await self._find(plugin, "GIS_ParcelNum8", "00215132000")
+        assert s["summary"]["matched"] is True
+        assert s["caveats"] == []
+        assert "found" in text.splitlines()[0]
+        assert len(wheres) == 2
+
+    @pytest.mark.asyncio
+    async def test_base_number_is_one_lookup_of_all_forms(self, plugin):
+        wheres = self._serve(plugin, "Parcel_ID", ["00215132000"])
+        _, s = await self._find(plugin, "Parcel_ID", "002-151-32")
+        assert s["summary"]["canonical"] == "00215132000"
+        assert len(wheres) == 1
+        for v in ("00215132", "002-151-32", "00215132000", "002-151-32-000"):
+            assert f"'{v}'" in wheres[0]
+
+
+class TestFootprintOverlayRecords:
+    """A Lease or Economic record is not a lot, and is not "not found"."""
+
+    @pytest.fixture
+    def plugin(self, anchorage_config):
+        p = AnchorageGISPlugin(anchorage_config)
+        p.plugin_config = AnchorageGISPluginConfig(**anchorage_config)
+        p._resolve_layer_url = AsyncMock(return_value="https://x/0")
+        return p
+
+    ECONOMIC = {
+        "attributes": {
+            "Parcel_ID": "00318487000",
+            "GIS_Category": "Economic",
+            "Parcel_Address": "1607 E 27TH AVE",
+        }
+    }
+
+    @pytest.mark.asyncio
+    async def test_economic_record_is_named_as_such(self, plugin):
+        plugin._request_json_with_retry = AsyncMock(
+            side_effect=[{"features": []}, {"features": [self.ECONOMIC]}]
+        )
+        text, s = await plugin._footprint_for_parcel(
+            {"parcel_id": "003-184-87"}
+        )
+        assert "is not a land parcel" in text
+        assert "no parcel found" not in text
+        assert "1607 E 27TH AVE" in text
+        assert s["result"] is None
+        (caveat,) = s["caveats"]
+        assert caveat["code"] == "not_a_land_parcel"
+        assert caveat["candidates"][0]["category"] == "Economic"
+        second = plugin._request_json_with_retry.await_args_list[1]
+        assert "GIS_Category" not in second.kwargs["data"]["where"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_number_is_still_not_found(self, plugin):
+        plugin._request_json_with_retry = AsyncMock(
+            side_effect=[{"features": []}, {"features": []}]
+        )
+        text, s = await plugin._footprint_for_parcel(
+            {"parcel_id": "999-999-99"}
+        )
+        assert "no parcel found" in text
+        assert s["caveats"][0]["code"] == "parcel_not_found"
+
+    @pytest.mark.asyncio
+    async def test_failed_second_lookup_falls_back_to_not_found(
+        self, plugin
+    ):
+        plugin._request_json_with_retry = AsyncMock(
+            side_effect=[{"features": []}, RuntimeError("upstream HTTP 503")]
+        )
+        text, s = await plugin._footprint_for_parcel(
+            {"parcel_id": "003-184-87"}
+        )
+        assert "no parcel found" in text
+        assert s["caveats"][0]["code"] == "parcel_not_found"
 
 
 class TestFindParcel:

@@ -237,7 +237,23 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
           and there must be exactly one;
         - more than 11 digits is not a parcel number (the extra ones
           used to be dropped silently).
+
+        The sub is "000" when the caller gave only a base number; use
+        ``_parcel_digits`` to tell that from a sub-parcel they named.
         """
+        digits = cls._parcel_digits(raw)
+        if digits is None:
+            return None
+        if len(digits) >= 9:
+            # 9-11 digits: the 11-digit form, leading zeros dropped.
+            padded = digits.rjust(11, "0")
+            return padded[:8], padded[8:]
+        # 5-8 digits: the 8-digit base, no sub-parcel.
+        return digits.rjust(8, "0"), "000"
+
+    @classmethod
+    def _parcel_digits(cls, raw: Any) -> Optional[str]:
+        """The 5 to 11 digits of a caller's parcel id, or None."""
         if raw is None:
             return None
         text = str(raw).strip()
@@ -254,12 +270,7 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
             digits = strict[0].replace("-", "")
         if len(digits) < 5 or len(digits) > 11:
             return None
-        if len(digits) >= 9:
-            # 9-11 digits: the 11-digit form, leading zeros dropped.
-            padded = digits.rjust(11, "0")
-            return padded[:8], padded[8:]
-        # 5-8 digits: the 8-digit base, no sub-parcel.
-        return digits.rjust(8, "0"), "000"
+        return digits
 
     _PARCEL_ID_UNREADABLE = (
         "Could not read a parcel ID from {parcel_id!r}. Pass the parcel "
@@ -361,13 +372,22 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
                 self._PARCEL_ID_UNREADABLE.format(parcel_id=parcel_id)
             )
 
-        # Build IN clause; SQL-quote each variant with '' escape.
-        quoted = ",".join(
-            "'" + v.replace("'", "''") + "'" for v in variants
-        )
-        where_in = WhereValidator.validate(
-            f"{parcel_field} IN ({quoted})"
-        )
+        # An 11-digit number names ONE record; a base number means every
+        # record under it. Both used to go into one IN list, so on a
+        # field holding the 8-digit base, asking for unit 001 of a
+        # condominium returned all its units with nothing to say the
+        # unit had been ignored. The 11-digit forms are now tried
+        # alone; the base forms apply only when they match nothing.
+        digits = self._parcel_digits(parcel_id) or ""
+        base8, sub3 = self._parcel_base_and_sub(parcel_id)
+        base_forms = [base8, f"{base8[0:3]}-{base8[3:6]}-{base8[6:8]}"]
+        if len(digits) >= 9:
+            passes = [
+                [v for v in variants if v not in base_forms],
+                base_forms,
+            ]
+        else:
+            passes = [list(variants)]
 
         # The matched field must come back even when the caller narrows
         # out_fields: it is what `canonical` and `matched_values` are
@@ -378,31 +398,44 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
             ","
         ):
             fetch_fields = f"{fetch_fields},{parcel_field}"
-        params = {
-            "f": "json",
-            "where": where_in,
-            "outFields": fetch_fields,
-            "returnGeometry": "false",
-            "resultRecordCount": str(limit),
-        }
-        resp = await self._send("get",
-            f"{layer_url}/query", params=params
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if "error" in data:
-            err = data["error"]
-            raise RuntimeError(
-                "Parcel lookup query failed: "
-                + self._rewrite_arcgis_error(
-                    err.get("message", "Unknown error"),
-                    err.get("details", []),
-                    resource_id=item_id,
-                    has_where=True,
-                )
+        data: Dict[str, Any] = {}
+        features: List[Dict[str, Any]] = []
+        on_base_only = False
+        for attempt, values in enumerate(passes):
+            # SQL-quote each value with '' escape.
+            quoted = ",".join(
+                "'" + v.replace("'", "''") + "'" for v in values
             )
+            params = {
+                "f": "json",
+                "where": WhereValidator.validate(
+                    f"{parcel_field} IN ({quoted})"
+                ),
+                "outFields": fetch_fields,
+                "returnGeometry": "false",
+                "resultRecordCount": str(limit),
+            }
+            resp = await self._send("get",
+                f"{layer_url}/query", params=params
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if "error" in data:
+                err = data["error"]
+                raise RuntimeError(
+                    "Parcel lookup query failed: "
+                    + self._rewrite_arcgis_error(
+                        err.get("message", "Unknown error"),
+                        err.get("details", []),
+                        resource_id=item_id,
+                        has_where=True,
+                    )
+                )
+            features = data.get("features", [])
+            if features:
+                on_base_only = attempt > 0
+                break
 
-        features = data.get("features", [])
         query_echo = {
             "item_id": item_id,
             "parcel_field": parcel_field,
@@ -422,6 +455,27 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
             # condo complex shares its master number). A full page, or
             # the server's own flag, means there may be more.
             match_caveats: List[Dict[str, Any]] = []
+            # Sub-parcel 000 is the parcel itself, so finding it under
+            # its base number in an 8-digit field is no surprise. Any
+            # other sub-parcel was asked for and not found.
+            if on_base_only and sub3 != "000":
+                match_caveats.append(
+                    {
+                        "code": "base_number_match",
+                        "count": len(features),
+                        "message": (
+                            f"`{parcel_field}` holds no record numbered "
+                            f"`{base8}{sub3}`. What follows matched on "
+                            f"the base number `{base_forms[1]}`, not "
+                            f"the sub-parcel `{sub3}`. Either that "
+                            f"sub-parcel does not exist, or this field "
+                            f"stores only the 8-digit base and cannot "
+                            f"tell units apart: look it up on an "
+                            f"11-digit field (Parcel_ID, "
+                            f"GIS_ParcelNum11) to get one unit."
+                        ),
+                    }
+                )
             if len(features) >= limit or data.get("exceededTransferLimit"):
                 match_caveats.append(
                     {
@@ -456,7 +510,11 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
             lines = [
                 f"## Parcel lookup: `{parcel_id}` -> "
                 f"{len(features)} record(s) "
-                + ("returned" if match_caveats else "found"),
+                + (
+                    "matched on the base number, not the sub-parcel"
+                    if on_base_only and sub3 != "000"
+                    else ("returned" if match_caveats else "found")
+                ),
                 f"**Layer:** `{item_id}`",
                 f"**Field:** `{parcel_field}`",
                 f"**Variants tried ({len(variants)}):** "
@@ -914,6 +972,105 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
         area = sum(pyclipper.Area(p) for p in solution)
         return abs(area) / (cls.CLIP_SCALE**2)
 
+    async def _footprint_overlay_records(
+        self, parcel_url: str, quoted: str
+    ) -> List[Dict[str, Any]]:
+        """Records carrying this number that are not land parcels.
+
+        The assessor layer stacks Lease and Economic records on top of
+        the parcels they sit on (about 1,400 of them). They have a
+        number and an address but no lot of their own, and the lookup
+        above leaves them out, so one of those numbers used to come
+        back as "no parcel found" -- for a record that
+        find_parcel then found.
+        """
+        try:
+            data = await self._request_json_with_retry(
+                f"{parcel_url}/query",
+                method="post",
+                data={
+                    "f": "json",
+                    "where": WhereValidator.validate(
+                        f"GIS_ParcelNum11 IN ({quoted}) "
+                        f"OR Parcel_ID IN ({quoted})"
+                    ),
+                    "outFields": "Parcel_ID,GIS_Category,Parcel_Address",
+                    "returnGeometry": "false",
+                    "resultRecordCount": "11",
+                },
+            )
+        except Exception as e:
+            # The answer without this is the plain "not found", which is
+            # no worse than before.
+            logger.warning(
+                "footprint_for_parcel overlay lookup failed: %s",
+                type(e).__name__,
+            )
+            return []
+        return [
+            f.get("attributes") or {} for f in data.get("features") or []
+        ]
+
+    def _footprint_not_a_parcel(
+        self, parcel_id: str, overlay: List[Dict[str, Any]]
+    ) -> Tuple[str, Dict[str, Any]]:
+        kinds = sorted(
+            {str(a.get("GIS_Category") or "unclassified") for a in overlay}
+        )
+        kind_txt = " / ".join(kinds)
+        addresses = list(
+            dict.fromkeys(
+                a.get("Parcel_Address")
+                for a in overlay
+                if a.get("Parcel_Address")
+            )
+        )
+        where_hint = (
+            f"Parcel_Address = '{addresses[0]}' AND GIS_Category = 'Parcel'"
+            if addresses
+            else "GIS_Category = 'Parcel'"
+        )
+        message = (
+            f"{parcel_id!r} is in the assessor layer as a {kind_txt}-category "
+            f"record, not a land parcel. Lease and Economic records are "
+            f"stacked on the parcels they occupy and have no lot of "
+            f"their own, so there is no lot coverage to compute for "
+            f"this number. Find the land parcel underneath"
+            + (f" (address {addresses[0]})" if addresses else "")
+            + " and call footprint_for_parcel with its Parcel_ID."
+        )
+        lines = [
+            f"## Lot coverage: `{parcel_id}` is not a land parcel",
+            f"**Record type:** {kind_txt}"
+            + (f"  |  **Address:** {addresses[0]}" if addresses else ""),
+            "",
+            f"_{message}_",
+            "",
+            f"_To find it: `query_data(item_id="
+            f"'{self.plugin_config.property_item_id}', "
+            f"where=\"{where_hint}\")`, or `spatial_query_point` on the "
+            f"parcel layer at the address._",
+        ]
+        return "\n".join(lines), {
+            "query": {"parcel_id": parcel_id},
+            "result": None,
+            "caveats": [
+                {
+                    "code": "not_a_land_parcel",
+                    "count": len(overlay),
+                    "message": message,
+                    "candidates": [
+                        {
+                            "parcel_id": a.get("Parcel_ID"),
+                            "category": a.get("GIS_Category"),
+                            "address": a.get("Parcel_Address"),
+                        }
+                        for a in overlay
+                    ],
+                }
+            ],
+        }
+
     async def _footprint_for_parcel(
         self, args: Dict[str, Any]
     ) -> Tuple[str, Dict[str, Any]]:
@@ -969,6 +1126,11 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
         features = data.get("features") or []
 
         if not features:
+            overlay = await self._footprint_overlay_records(
+                parcel_url, quoted
+            )
+            if overlay:
+                return self._footprint_not_a_parcel(parcel_id, overlay)
             return "\n".join([
                 f"## Lot coverage: no parcel found for `{parcel_id}`",
                 f"**Variants tried ({len(variants)}):** "
