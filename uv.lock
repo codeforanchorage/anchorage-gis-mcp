@@ -1073,8 +1073,8 @@ requires-dist = [
     { name = "aiohttp", marker = "extra == 'dev'", specifier = ">=3.14.5" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.0.0" },
-    { name = "opencontext-arcgis-hub", git = "https://github.com/codeforanchorage/opencontext-arcgis-hub?rev=v1.0.0" },
-    { name = "opencontext-core", git = "https://github.com/codeforanchorage/opencontext-core?rev=v1.4.0" },
+    { name = "opencontext-arcgis-hub", git = "https://github.com/codeforanchorage/opencontext-arcgis-hub?rev=v1.1.0" },
+    { name = "opencontext-core", git = "https://github.com/codeforanchorage/opencontext-core?rev=v1.4.1" },
     { name = "pip-audit", marker = "extra == 'dev'", specifier = ">=2.0.0" },
     { name = "pyclipper", specifier = ">=1.4.0" },
     { name = "pydantic", specifier = ">=2.14.3" },
@@ -1090,8 +1090,8 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "opencontext-arcgis-hub"
-version = "1.0.0"
-source = { git = "https://github.com/codeforanchorage/opencontext-arcgis-hub?rev=v1.0.0#e1d15f4f1049b690703e7374c8ade85ac41fe813" }
+version = "1.1.0"
+source = { git = "https://github.com/codeforanchorage/opencontext-arcgis-hub?rev=v1.1.0#537de153ff66f21322e6f5eb5441b31c37615c24" }
 dependencies = [
     { name = "httpx" },
     { name = "pyclipper" },
@@ -1100,8 +1100,8 @@ dependencies = [
 
 [[package]]
 name = "opencontext-core"
-version = "1.4.0"
-source = { git = "https://github.com/codeforanchorage/opencontext-core?rev=v1.4.0#7e1ce20d22bcaed624612e0dc9e0f466a2b684d0" }
+version = "1.4.1"
+source = { git = "https://github.com/codeforanchorage/opencontext-core?rev=v1.4.1#9ee59d0958596f4aff4e6217cbb864ed8b48b86d" }
 dependencies = [
     { name = "pydantic" },
     { name = "python-json-logger" },
