@@ -8,7 +8,7 @@ import pytest
 from unittest.mock import AsyncMock, Mock, patch
 
 
-from core.interfaces import PluginType
+from core.interfaces import PluginType, ToolInputError
 from plugins.anchorage_gis.config_schema import AnchorageGISPluginConfig
 from plugins.anchorage_gis.plugin import AnchorageGISPlugin
 
@@ -295,6 +295,178 @@ class TestNormalizeParcelVariants:
         assert AnchorageGISPlugin._normalize_parcel_variants(
             "no digits here"
         ) == []
+
+
+    # -- digits from around the id must not be run into it --
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "Lot 5 Block 12, 003-184-87",
+            "003-184-87 (Lot 5, Block 12)",
+            "PID: 00318487",
+            "parcel #003-184-87-000.",
+        ],
+    )
+    def test_surrounding_text_does_not_change_the_id(self, raw):
+        out = AnchorageGISPlugin._normalize_parcel_variants(raw)
+        assert "00318487" in out
+        assert "003-184-87-000" in out
+        assert not any("512" in v for v in out if v != raw.strip())
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "1820 Parkside Dr 99501",  # an address is not a parcel id
+            "1820 Parkside Dr, Anchorage, AK 99501-1234",
+            "003-184-87 or 001-213-29",  # two ids: which one?
+            "Lot 5 Block 12",
+            "0031848700099",  # 13 digits: not a parcel number
+            "Parcel 1-213-29",  # short form only when it stands alone
+            "A00318487",  # part of a longer identifier
+        ],
+    )
+    def test_unreadable_input_is_refused(self, raw):
+        assert AnchorageGISPlugin._normalize_parcel_variants(raw) == []
+
+    @pytest.mark.parametrize(
+        "raw, base, full",
+        [
+            ("003 184 87", "00318487", "00318487000"),
+            ("003.184.87", "00318487", "00318487000"),
+            ("318487000", "00318487", "00318487000"),
+            ("3-184-87-001", "00318487", "00318487001"),
+        ],
+    )
+    def test_id_alone_in_any_spelling(self, raw, base, full):
+        out = AnchorageGISPlugin._normalize_parcel_variants(raw)
+        assert base in out and full in out
+
+
+class TestFindParcelCandidates:
+    """The near-miss search behind a find_parcel that matched nothing."""
+
+    @pytest.fixture
+    def plugin(self, anchorage_config):
+        p = AnchorageGISPlugin(anchorage_config)
+        p.plugin_config = AnchorageGISPluginConfig(**anchorage_config)
+        p._resolve_layer_url = AsyncMock(return_value="https://x/0")
+        p._fetch_layer_meta = AsyncMock(
+            return_value={"fields": [{"name": "Parcel_Num"}]}
+        )
+        return p
+
+    @staticmethod
+    def _resp(payload):
+        r = Mock()
+        r.status_code = 200
+        r.raise_for_status = Mock()
+        r.json.return_value = payload
+        return r
+
+    async def _miss(self, plugin, second, parcel_id="003-184-87"):
+        effects = [self._resp({"features": []})]
+        if second is not None:
+            effects.append(
+                second
+                if isinstance(second, Exception)
+                else self._resp(second)
+            )
+        plugin._send = AsyncMock(side_effect=effects)
+        return await plugin._find_parcel(
+            {
+                "item_id": "a" * 32,
+                "parcel_field": "Parcel_Num",
+                "parcel_id": parcel_id,
+            }
+        )
+
+    @pytest.mark.asyncio
+    async def test_searches_compact_and_hyphenated_forms(self, plugin):
+        await self._miss(plugin, {"features": []})
+        params = plugin._send.await_args_list[1].kwargs["params"]
+        assert "LIKE '%318487%'" in params["where"]
+        assert "LIKE '%3-184-87%'" in params["where"]
+        assert params["orderByFields"] == "Parcel_Num"
+
+    @pytest.mark.asyncio
+    async def test_search_uses_the_parcel_base_not_typed_digits(
+        self, plugin
+    ):
+        # 11-digit input with a sub-parcel: the base is what near
+        # misses share, and text around the id plays no part.
+        await self._miss(
+            plugin, {"features": []}, parcel_id="Parcel 003-184-87-001"
+        )
+        where = plugin._send.await_args_list[1].kwargs["params"]["where"]
+        assert "'%318487%'" in where and "001" not in where
+
+    @pytest.mark.asyncio
+    async def test_repeated_values_are_listed_once(self, plugin):
+        rows = [{"attributes": {"Parcel_Num": "00318487001"}}] * 7 + [
+            {"attributes": {"Parcel_Num": "00318487002"}}
+        ]
+        text, structured = await self._miss(plugin, {"features": rows})
+        (caveat,) = structured["caveats"]
+        assert caveat["candidates"] == [
+            {"Parcel_Num": "00318487001"},
+            {"Parcel_Num": "00318487002"},
+        ]
+        assert caveat["count"] == 2
+        assert "there may be more" not in caveat["message"]
+        assert text.count("`00318487001`") == 1
+
+    @pytest.mark.asyncio
+    async def test_more_than_five_values_says_so(self, plugin):
+        rows = [
+            {"attributes": {"Parcel_Num": f"0031848700{i}"}}
+            for i in range(8)
+        ]
+        text, structured = await self._miss(plugin, {"features": rows})
+        (caveat,) = structured["caveats"]
+        assert len(caveat["candidates"]) == 5
+        assert "there may be more" in caveat["message"]
+        assert "cut short" in text
+
+    @pytest.mark.asyncio
+    async def test_failed_search_is_not_reported_as_absence(self, plugin):
+        text, structured = await self._miss(
+            plugin, RuntimeError("upstream HTTP 503")
+        )
+        (caveat,) = structured["caveats"]
+        assert caveat["code"] == "parcel_not_found"
+        assert "could not be completed" in caveat["message"]
+        assert "not evidence the parcel is absent" in caveat["message"]
+        assert "may not exist" not in caveat["message"]
+        assert "may not exist" not in text
+        assert "candidates" not in caveat
+
+    @pytest.mark.asyncio
+    async def test_error_body_is_a_failed_search(self, plugin):
+        _, structured = await self._miss(
+            plugin, {"error": {"code": 400, "message": "Invalid query"}}
+        )
+        assert "Invalid query" in structured["caveats"][0]["message"]
+
+    @pytest.mark.asyncio
+    async def test_too_few_digits_skips_the_search(self, plugin):
+        # 00000123 leaves "123": it matches thousands of parcels.
+        _, structured = await self._miss(plugin, None, parcel_id="00123")
+        assert plugin._send.await_count == 1
+        assert "candidates" not in structured["caveats"][0]
+
+    @pytest.mark.asyncio
+    async def test_address_is_refused_before_any_request(self, plugin):
+        plugin._send = AsyncMock()
+        with pytest.raises(ToolInputError, match="not a parcel ID"):
+            await plugin._find_parcel(
+                {
+                    "item_id": "a" * 32,
+                    "parcel_field": "Parcel_Num",
+                    "parcel_id": "1820 Parkside Dr 99501",
+                }
+            )
+        plugin._send.assert_not_called()
 
 
 class TestFindParcel:

@@ -211,6 +211,63 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
 
     # ── Parcel tools ─────────────────────────────────────────────────────
 
+    # A token with the complete shape of a parcel number: the only kind
+    # picked out of surrounding text.
+    _PARCEL_STRICT_RE = re.compile(
+        r"[0-9]{3}-[0-9]{3}-[0-9]{2}(?:-[0-9]{3})?|[0-9]{8}|[0-9]{11}"
+    )
+    _PARCEL_TOKEN_RE = re.compile(
+        r"(?<![0-9A-Za-z-])[0-9]+(?:-[0-9]+)*(?![0-9A-Za-z-])"
+    )
+    _PARCEL_ALONE_RE = re.compile(r"[0-9][0-9 \t.\-]*")
+
+    @classmethod
+    def _parcel_base_and_sub(cls, raw: Any) -> Optional[Tuple[str, str]]:
+        """(8-digit base, 3-digit sub) read from a caller's parcel id.
+
+        Every digit in the input used to be run together, so "Lot 5
+        Block 12, 003-184-87" became 51200318487 and an address with a
+        ZIP code became a parcel number: a lookup of a DIFFERENT parcel,
+        answered as if it were the one asked for. Now:
+
+        - an id on its own (digits with hyphens, spaces or dots) is
+          read whole, leading zeros optional;
+        - in free text, only a token with the full shape of a parcel
+          number counts (XXX-XXX-XX, XXX-XXX-XX-XXX, 8 or 11 digits),
+          and there must be exactly one;
+        - more than 11 digits is not a parcel number (the extra ones
+          used to be dropped silently).
+        """
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        if cls._PARCEL_ALONE_RE.fullmatch(text):
+            digits = re.sub(r"[^0-9]", "", text)
+        else:
+            strict = [
+                t
+                for t in cls._PARCEL_TOKEN_RE.findall(text)
+                if cls._PARCEL_STRICT_RE.fullmatch(t)
+            ]
+            if len(set(strict)) != 1:
+                return None
+            digits = strict[0].replace("-", "")
+        if len(digits) < 5 or len(digits) > 11:
+            return None
+        if len(digits) >= 9:
+            # 9-11 digits: the 11-digit form, leading zeros dropped.
+            padded = digits.rjust(11, "0")
+            return padded[:8], padded[8:]
+        # 5-8 digits: the 8-digit base, no sub-parcel.
+        return digits.rjust(8, "0"), "000"
+
+    _PARCEL_ID_UNREADABLE = (
+        "Could not read a parcel ID from {parcel_id!r}. Pass the parcel "
+        "ID on its own, like '001-213-29', '00121329', or '00121329000' "
+        "(5 to 11 digits). An address is not a parcel ID: resolve it "
+        "first with query_data on the parcel layer's Parcel_Address."
+    )
+
     @staticmethod
     def _normalize_parcel_variants(raw: Any) -> List[str]:
         """Generate MOA parcel ID format variants for cross-dataset
@@ -231,33 +288,16 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
         rarely knows which form a given layer uses, so we generate
         all four for use in ``WHERE field IN (...)``.
 
-        Input handling: extracts digits from the input, pads/splits
-        based on length to recover the 8-digit base + 3-digit sub.
-        Hyphens, leading zeros, and prefixes/suffixes are flexible.
+        Input handling: the ID may be written with hyphens, spaces or
+        dots and with leading zeros dropped. Free text around it is
+        accepted only when exactly one token in it has the full shape
+        of a parcel number (see ``_parcel_base_and_sub``); returns []
+        when no single ID can be read.
         """
-        if raw is None:
+        parts = AnchorageGISPlugin._parcel_base_and_sub(raw)
+        if parts is None:
             return []
-        digits = "".join(c for c in str(raw) if c.isdigit())
-        if not digits or len(digits) < 5:
-            return []
-
-        if len(digits) >= 11:
-            # Take the LAST 11 digits -- accommodates inputs like
-            # "Parcel 00318487000" if any non-digit prefixes slipped
-            # through.
-            tail = digits[-11:]
-            base8 = tail[:8]
-            sub3 = tail[8:11]
-        elif len(digits) >= 9:
-            # 9 or 10 digits -- pad on the left to 11, then split.
-            padded = digits.rjust(11, "0")
-            base8 = padded[:8]
-            sub3 = padded[8:11]
-        else:
-            # 5-8 digits -- pad on the left to 8, default to no
-            # sub-parcel.
-            base8 = digits.rjust(8, "0")
-            sub3 = "000"
+        base8, sub3 = parts
 
         variants: set = set()
         variants.add(base8)
@@ -318,9 +358,7 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
         variants = self._normalize_parcel_variants(parcel_id)
         if not variants:
             raise ToolInputError(
-                f"Could not extract any digits from parcel_id "
-                f"{parcel_id!r}. Provide a parcel ID like "
-                f"'001-213-29', '00121329', or '00121329000'."
+                self._PARCEL_ID_UNREADABLE.format(parcel_id=parcel_id)
             )
 
         # Build IN clause; SQL-quote each variant with '' escape.
@@ -445,42 +483,17 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
                 lines.append("")
             return "\n".join(lines), structured
 
-        # Not found via exact match. Fall back to LIKE on a distinctive
-        # digit substring. Skip the first 3 chars (often leading
-        # zeros + low-info prefix) to maximise selectivity.
-        digits = "".join(c for c in parcel_id if c.isdigit())
-        candidates: List[Dict[str, Any]] = []
-        substring_used = ""
-        if len(digits) >= 5:
-            # Pick a 6-char window starting after any leading zeros for
-            # distinctiveness; fall back to the longest available.
-            stripped = digits.lstrip("0")
-            substring_used = (
-                stripped[:6] if len(stripped) >= 6 else stripped
-            )
-            if substring_used:
-                safe_sub = substring_used.replace("'", "''")
-                like_where = WhereValidator.validate(
-                    f"{parcel_field} LIKE '%{safe_sub}%'"
-                )
-                try:
-                    like_resp = await self._send("get",
-                        f"{layer_url}/query",
-                        params={
-                            "f": "json",
-                            "where": like_where,
-                            "outFields": parcel_field,
-                            "returnGeometry": "false",
-                            "resultRecordCount": "5",
-                        },
-                    )
-                    like_resp.raise_for_status()
-                    like_data = like_resp.json()
-                    if "error" not in like_data:
-                        candidates = like_data.get("features") or []
-                except Exception:
-                    candidates = []
+        # Not found via exact match: look for near misses.
+        (
+            candidates,
+            substring_used,
+            more_candidates,
+            search_failed,
+        ) = await self._parcel_like_candidates(
+            layer_url, parcel_field, parcel_id
+        )
 
+        like_hint = substring_used.split(" or ")[0]
         lines = [
             f"## Parcel lookup: no exact match for `{parcel_id}`",
             f"**Layer:** `{item_id}`",
@@ -491,19 +504,32 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
         ]
         if candidates:
             lines.append(
-                f"**LIKE fallback** with substring "
-                f"`%{substring_used}%` returned "
+                f"**LIKE fallback** on `{substring_used}` returned "
                 f"{len(candidates)} candidate(s):"
             )
             lines.append("")
-            for c in candidates:
-                attrs = c.get("attributes") or {}
-                v = attrs.get(parcel_field)
+            for v in candidates:
                 lines.append(f"- `{v}`")
             lines += [
                 "",
-                "_Pick the right candidate above and use its EXACT "
-                "value for follow-up queries on this layer._",
+                "_These contain the same digits; they are near misses, "
+                "not the parcel asked for. Use one only if it is "
+                "plainly the parcel meant, with its EXACT value._",
+            ]
+            if more_candidates:
+                lines.append(
+                    "_The search was cut short: other values "
+                    "containing these digits may exist beyond the "
+                    f"{len(candidates)} listed._"
+                )
+        elif search_failed:
+            lines += [
+                "_The search for near matches could not be completed "
+                f"({search_failed}), so there are no candidates to "
+                "show. That is not evidence the parcel is absent: try "
+                "again, or "
+                f"`get_distinct_values(item_id='{item_id}', "
+                f"field='{parcel_field}', like='{like_hint}')`._",
             ]
         else:
             lines += [
@@ -512,7 +538,7 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
                 "ID in an unrecognised format. Try "
                 f"`get_distinct_values(item_id='{item_id}', "
                 f"field='{parcel_field}', "
-                f"like='{substring_used or digits[:6]}')` to discover "
+                f"like='{like_hint}')` to discover "
                 f"the storage format._",
             ]
 
@@ -520,10 +546,20 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
             miss_message = (
                 f"No exact match for {parcel_id!r} in any of "
                 f"{len(variants)} format variants. A LIKE search on "
-                f"'%{substring_used}%' found {len(candidates)} "
-                "candidate(s), listed in `candidates`: pick the right "
-                "one and use its EXACT value for follow-up queries on "
-                "this layer."
+                f"{substring_used} found {len(candidates)} "
+                "near miss(es), listed in `candidates`"
+                + (" (there may be more)" if more_candidates else "")
+                + ". They are not the parcel asked for: use one only "
+                "if it is plainly the parcel meant, with its EXACT "
+                "value."
+            )
+        elif search_failed:
+            miss_message = (
+                f"No exact match for {parcel_id!r}. The search for near "
+                f"matches could not be completed ({search_failed}), "
+                "which is not evidence the parcel is absent; try again "
+                f"or get_distinct_values(item_id='{item_id}', "
+                f"field='{parcel_field}', like='{like_hint}')."
             )
         else:
             miss_message = (
@@ -532,7 +568,7 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
                 "the field stores the id in an unrecognised format; try "
                 f"get_distinct_values(item_id='{item_id}', "
                 f"field='{parcel_field}', "
-                f"like='{substring_used or digits[:6]}') to discover it."
+                f"like='{like_hint}') to discover it."
             )
         caveat: Dict[str, Any] = {
             "code": "parcel_not_found",
@@ -541,12 +577,7 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
         }
         if candidates:
             caveat["candidates"] = [
-                {
-                    parcel_field: self._scalar(
-                        (c.get("attributes") or {}).get(parcel_field)
-                    )
-                }
-                for c in candidates
+                {parcel_field: self._scalar(v)} for v in candidates
             ]
         structured = {
             "query": query_echo,
@@ -560,6 +591,83 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
             "caveats": [caveat],
         }
         return "\n".join(lines), structured
+
+    PARCEL_CANDIDATES_SHOWN = 5
+    PARCEL_CANDIDATE_ROWS = 50
+
+    async def _parcel_like_candidates(
+        self, layer_url: str, parcel_field: str, parcel_id: str
+    ) -> Tuple[List[Any], str, bool, str]:
+        """Near misses for a parcel id that matched nothing exactly.
+
+        Returns (distinct values, the digits searched for, whether more
+        values exist than are returned, a failure description or "").
+
+        What this replaced searched for the first six digits the caller
+        typed, compact only, so it could never match a field stored
+        with hyphens; took five rows with no ordering, so the same
+        value could fill all five; and treated a failed search as
+        "no candidates", which reads as "the parcel does not exist".
+        """
+        parts = self._parcel_base_and_sub(parcel_id)
+        if parts is None:
+            return [], "", False, ""
+        base8 = parts[0]
+        compact = base8.lstrip("0")
+        if len(compact) < 4:
+            # Three digits match thousands of parcels; no shortlist of
+            # five drawn from them means anything.
+            return [], base8, False, ""
+        hyphenated = f"{base8[0:3]}-{base8[3:6]}-{base8[6:8]}".lstrip("0-")
+        where = WhereValidator.validate(
+            f"{parcel_field} LIKE '%{compact}%' "
+            f"OR {parcel_field} LIKE '%{hyphenated}%'"
+        )
+        searched = f"{compact} or {hyphenated}"
+        try:
+            resp = await self._send(
+                "get",
+                f"{layer_url}/query",
+                params={
+                    "f": "json",
+                    "where": where,
+                    "outFields": parcel_field,
+                    "returnGeometry": "false",
+                    "orderByFields": parcel_field,
+                    "resultRecordCount": str(self.PARCEL_CANDIDATE_ROWS),
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if "error" in data:
+                err = data["error"]
+                message = (
+                    err.get("message") if isinstance(err, dict) else None
+                )
+                raise RuntimeError(message or "ArcGIS returned an error")
+        except Exception as e:
+            logger.warning(
+                "find_parcel candidate search failed: %s",
+                type(e).__name__,
+            )
+            return [], searched, False, str(e) or type(e).__name__
+        rows = data.get("features") or []
+        values = list(
+            dict.fromkeys(
+                v
+                for v in (
+                    (r.get("attributes") or {}).get(parcel_field)
+                    for r in rows
+                )
+                if v is not None
+            )
+        )
+        shown = values[: self.PARCEL_CANDIDATES_SHOWN]
+        more = len(values) > len(shown) or (
+            len(rows) >= self.PARCEL_CANDIDATE_ROWS
+            or bool(data.get("exceededTransferLimit"))
+        )
+        return shown, searched, more, ""
 
     # ── footprint_for_parcel: lot coverage / ADU headroom ────────────────
     #
@@ -834,9 +942,7 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
         variants = self._normalize_parcel_variants(parcel_id)
         if not variants:
             raise ToolInputError(
-                f"Could not extract any digits from parcel_id "
-                f"{parcel_id!r}. Provide a parcel ID like "
-                f"'001-213-29', '00121329', or '00121329000'."
+                self._PARCEL_ID_UNREADABLE.format(parcel_id=parcel_id)
             )
 
         parcel_item_id = self.plugin_config.property_item_id
