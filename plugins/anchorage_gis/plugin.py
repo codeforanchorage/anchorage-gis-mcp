@@ -844,6 +844,12 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
     # but not toward building_count.
     FOOTPRINT_COUNT_MIN_M2 = 1.0
     FOOTPRINT_BUILDING_LIMIT = 500
+    # Rows fetched for one parcel number. A parcel whose land is in
+    # several pieces is published as several rows with the SAME
+    # Parcel_ID, one polygon each, and all of them are the lot (39 such
+    # parcels in November 2026, up to 8 rows). Different Parcel_IDs under
+    # one root number are condo units, which are listed, not measured.
+    FOOTPRINT_PARCEL_ROW_LIMIT = 50
     # Fields fetched from the assessor parcel layer for the report.
     FOOTPRINT_PARCEL_FIELDS = (
         "Parcel_ID",
@@ -1123,7 +1129,7 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
                 "outFields": ",".join(self.FOOTPRINT_PARCEL_FIELDS),
                 "returnGeometry": "true",
                 "outSR": "3338",
-                "resultRecordCount": "11",
+                "resultRecordCount": str(self.FOOTPRINT_PARCEL_ROW_LIMIT),
             },
         )
         features = data.get("features") or []
@@ -1262,13 +1268,30 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
                 ],
             }
 
-        geom = feat.get("geometry") or {}
-        rings = geom.get("rings") or []
+        # The lot is EVERY row carrying this Parcel_ID, not the first.
+        # A parcel in several pieces is one row per piece, and Lot_Size is
+        # the whole parcel's: measuring the first polygon against it made
+        # a mall on 8 polygons read 5.8% covered, from one building on a
+        # seventh of its land.
+        part_rings = [
+            ((f.get("geometry") or {}).get("rings") or [])
+            for f in features
+        ]
+        part_rings = [r for r in part_rings if r]
+        rings = [ring for rings_of_part in part_rings for ring in rings_of_part]
         if not rings:
             raise ToolInputError(
                 f"Parcel {canonical_id} has no polygon geometry in "
                 f"the parcel layer, so buildings cannot be joined."
             )
+        parcel_parts = len(part_rings)
+        if parcel_parts > 1:
+            # A true union, not concatenation: should two rows overlap (a
+            # duplicated row, say), concatenated rings cancel each other
+            # under the even-odd rule the clip and the upstream filter use.
+            unioned = self._union_esri_rings(rings)
+            if unioned:
+                rings = unioned
 
         # Spatial join: buildings intersecting the parcel polygon.
         # Both filter and output stay in EPSG:3338 -- the filter via
@@ -1334,6 +1357,24 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
             * self.M2_TO_SQFT
         )
 
+        # A parcel in several pieces whose assessor Lot_Size does not match
+        # the land mapped under its Parcel_ID. Two kinds exist in the data:
+        # the Lot_Size is the total of the pieces (then nothing is wrong),
+        # or it matches ONE piece and the others ride along on the same
+        # number. In the second kind the footprint above covers land the
+        # Lot_Size does not, so dividing one by the other overstates
+        # coverage, and whether the pieces are one lot or several -- which
+        # decides what a coverage cap even applies to -- cannot be read
+        # from this layer. So: coverage is reported against the land that
+        # was actually measured, and no cap-based figure is offered.
+        lot_basis_uncertain = (
+            parcel_parts > 1
+            and parcel_geom_sqft > 0
+            and abs(parcel_geom_sqft - lot_sqft) > 0.15 * lot_sqft
+        )
+        if lot_basis_uncertain:
+            coverage = footprint_sqft / parcel_geom_sqft
+
         zone_raw = attrs.get("Zoning_District")
         base_zone, code_area = self._normalize_zoning_district(zone_raw)
         bowl_cap = self.LOT_COVERAGE_CAPS.get(base_zone)
@@ -1397,10 +1438,15 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
             max_footprint_sqft = lot_sqft * cap
             headroom_sqft = max_footprint_sqft - footprint_sqft
 
+        if lot_basis_uncertain:
+            max_footprint_sqft = None
+            headroom_sqft = None
+
         note3_applies = (
             code_area == "bowl"
             and base_zone in self.LOT_COVERAGE_NOTE3_DISTRICTS
             and lot_sqft < self.NOTE3_LOT_SQFT
+            and not lot_basis_uncertain
         )
         headroom_note3: Optional[float] = None
         if note3_applies:
@@ -1449,7 +1495,26 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
             caveats.append(
                 {"code": "cap_source", "message": f"Cap: {cap_note}."}
             )
-        if lot_sqft > 0 and abs(parcel_geom_sqft - lot_sqft) > (
+        if lot_basis_uncertain:
+            caveats.append(
+                {
+                    "code": "multipart_lot_basis_uncertain",
+                    "count": parcel_parts,
+                    "message": (
+                        f"The assessor Lot_Size is {lot_sqft:,.0f} sqft, but "
+                        f"{parcel_geom_sqft:,.0f} sqft of land is mapped "
+                        f"under this Parcel_ID in {parcel_parts} pieces "
+                        f"(>15% apart), so the Lot_Size appears to describe "
+                        f"only part of it. Coverage here is the footprint "
+                        f"over ALL the mapped land, not over the Lot_Size. "
+                        f"No maximum footprint or headroom is given: "
+                        f"whether the pieces form one lot or several, which "
+                        f"decides what the coverage cap applies to, cannot "
+                        f"be told from this record. Check the plat."
+                    ),
+                }
+            )
+        elif lot_sqft > 0 and abs(parcel_geom_sqft - lot_sqft) > (
             0.15 * lot_sqft
         ):
             caveats.append(
@@ -1461,6 +1526,32 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
                         f"Lot_Size of {lot_sqft:,.0f} sqft (>15% apart). "
                         f"Coverage uses the assessor figure; treat "
                         f"results with care."
+                    ),
+                }
+            )
+        if parcel_parts > 1:
+            caveats.append(
+                {
+                    "code": "multipart_parcel",
+                    "count": parcel_parts,
+                    "message": (
+                        f"This parcel is mapped as {parcel_parts} separate "
+                        f"polygons under one Parcel_ID. All of them are "
+                        f"measured together; the figures are for the "
+                        f"parcel as a whole, not for any one piece."
+                    ),
+                }
+            )
+        if len(features) >= self.FOOTPRINT_PARCEL_ROW_LIMIT:
+            caveats.append(
+                {
+                    "code": "parcel_parts_cap_reached",
+                    "limit": self.FOOTPRINT_PARCEL_ROW_LIMIT,
+                    "message": (
+                        f"Hit the {self.FOOTPRINT_PARCEL_ROW_LIMIT}-row cap "
+                        f"on polygons for this parcel; some of its land "
+                        f"may be missing, so the footprint may be "
+                        f"undercounted."
                     ),
                 }
             )
@@ -1498,6 +1589,12 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
             "building_count": building_count,
             "buildings_intersecting": len(bldg_feats),
         }
+        if parcel_parts > 1:
+            payload["parcel_parts"] = parcel_parts
+            payload["mapped_area_sqft"] = round(parcel_geom_sqft)
+            payload["coverage_basis"] = (
+                "mapped_area" if lot_basis_uncertain else "assessor_lot_size"
+            )
         if note3_applies:
             payload["headroom_if_note3_50pct"] = round(headroom_note3)
             payload["note3_conditional"] = (
@@ -1516,7 +1613,18 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
             f"**Building footprint on lot (clipped):** "
             f"{footprint_sqft:,.0f} sqft across {building_count} "
             f"building(s)",
-            f"**Coverage:** {coverage:.1%} of lot"
+            (
+                f"**Land mapped under this Parcel_ID:** "
+                f"{parcel_geom_sqft:,.0f} sqft in {parcel_parts} pieces"
+                if parcel_parts > 1
+                else None
+            ),
+            f"**Coverage:** {coverage:.1%} of "
+            + (
+                "the mapped land (all pieces)"
+                if lot_basis_uncertain
+                else "lot"
+            )
             + (
                 f"  |  **District cap:** {cap:.0%} "
                 f"(AMC Table 21.06-1)"
@@ -1524,6 +1632,7 @@ class AnchorageGISPlugin(ArcGISHubPlugin):
                 else "  |  **District cap:** n/a"
             ),
         ]
+        lines = [line for line in lines if line is not None]
         if max_footprint_sqft is not None:
             lines.append(
                 f"**Max footprint at cap:** "
