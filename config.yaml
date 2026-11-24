@@ -98,6 +98,21 @@ instructions: |
     caveats: headroom is a footprint envelope -- setbacks and the ADU
     floor-area cap are separate constraints.
 
+  "Which district is this in" -- point-in-polygon questions:
+  - "Which community council / zoning district / assembly district /
+    service area is <address or place> in?" is ONE spatial_query_point
+    call on the boundary layer with the location's lon/lat. The server
+    tests containment; it returns the polygon(s) holding the point.
+  - Do NOT download the boundary polygons (query_data with
+    return_geometry=true) to test containment yourself, and do not
+    re-fetch them per address: that is dozens of calls for an answer one
+    call gives.
+  - If you only have a street address, get its point first: query the
+    address-point layer (find_gis_content("addresses")) on house number
+    and street name with return_geometry=true, limit=1, then pass that
+    lon/lat to spatial_query_point. For several addresses, repeat those
+    two calls per address.
+
   All tools are READ-ONLY and safe to call without confirmation.
 
 plugins:

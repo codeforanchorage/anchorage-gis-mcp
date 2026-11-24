@@ -7,7 +7,7 @@ opencontext-core @ git+https://github.com/codeforanchorage/opencontext-core@v1.5
 # plugin has in common with the other ArcGIS Hub servers. The plugin in
 # plugins/ subclasses it. Upgrade by moving the tag; keep in step with
 # pyproject.toml.
-opencontext-arcgis-hub @ git+https://github.com/codeforanchorage/opencontext-arcgis-hub@v1.2.4
+opencontext-arcgis-hub @ git+https://github.com/codeforanchorage/opencontext-arcgis-hub@v1.3.0
 
 # Floors = the versions tested on python3.14 and deployed 2026-11-08.
 # deploy.sh resolves the newest versions that satisfy these on every build,
